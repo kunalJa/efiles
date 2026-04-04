@@ -1,0 +1,34 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+develop-eggs/
+
+# --- uv (Python Package Manager) ---
+.uv
+.uv.lock
+# Keep pyproject.toml and .python-version!
+
+# --- Windsurf / Codeium IDE ---
+.codeium/
+.windsurf/
+
+# --- AWS / Boto3 ---
+.env
+.aws/
+credentials
+*.pem
+*.key
+
+# --- OS Specific ---
+.DS_Store
+Thumbs.db
+
