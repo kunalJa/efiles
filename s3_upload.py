@@ -8,6 +8,7 @@ Usage:
     python s3_upload.py --volume 3          # Upload only VOL00003
     python s3_upload.py --dry-run           # List files without uploading
     python s3_upload.py --workers 100       # Use 100 threads (default: 50)
+    python s3_upload.py --first-page-only   # Only upload first page of each document
 """
 
 import argparse
@@ -16,14 +17,17 @@ import re
 import sys
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from io import BytesIO
 from pathlib import Path
 from threading import Lock
 
 import boto3
+import pikepdf
 from dotenv import load_dotenv
 
 # Base path to E_Files (WSL mount of Windows path)
-E_FILES_BASE = os.getenv("E_FILES_BASE")
+# Will be loaded from environment in main()
+E_FILES_BASE = None
 
 # Volume numbers to process (1-12, skipping 9)
 ALL_VOLUMES = [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12]
@@ -184,15 +188,53 @@ def analyze_page_distribution(file_paths: list[str]) -> dict:
     }
 
 
-def upload_single_file(s3_client, bucket_name: str, local_path: str, s3_key: str) -> tuple[str, bool, str]:
+def extract_first_page(pdf_path: str) -> BytesIO:
+    """
+    Extract the first page from a PDF and return it as a BytesIO buffer.
+    
+    Uses pikepdf (C++ QPDF wrapper) for:
+    - Lossless extraction: preserves color profiles, fonts, vectors
+    - GIL bypass: C++ operations don't block Python threads
+    """
+    with pikepdf.open(pdf_path) as pdf:
+        # Create new PDF with only the first page
+        dst = pikepdf.Pdf.new()
+        dst.pages.append(pdf.pages[0])
+        
+        buffer = BytesIO()
+        dst.save(buffer)
+        buffer.seek(0)
+        return buffer
+
+
+def upload_single_file(
+    s3_client,
+    bucket_name: str,
+    local_path: str,
+    s3_key: str,
+    first_page_only: bool = False
+) -> tuple[str, bool, str]:
     """
     Upload a single file to S3.
+    
+    Args:
+        s3_client: boto3 S3 client
+        bucket_name: S3 bucket name
+        local_path: Path to the local PDF file
+        s3_key: S3 object key
+        first_page_only: If True, extract and upload only the first page
     
     Returns:
         Tuple of (local_path, success_bool, error_message)
     """
     try:
-        s3_client.upload_file(local_path, bucket_name, s3_key)
+        if first_page_only:
+            # Extract first page and upload from memory
+            pdf_buffer = extract_first_page(local_path)
+            s3_client.upload_fileobj(pdf_buffer, bucket_name, s3_key)
+        else:
+            # Upload the entire file
+            s3_client.upload_file(local_path, bucket_name, s3_key)
         return (local_path, True, "")
     except Exception as e:
         return (local_path, False, str(e))
@@ -202,7 +244,8 @@ def upload_files_parallel(
     bucket_name: str,
     file_paths: list[str],
     max_workers: int = 50,
-    dry_run: bool = False
+    dry_run: bool = False,
+    first_page_only: bool = False
 ) -> dict:
     """
     Upload multiple files to S3 using a thread pool.
@@ -212,6 +255,7 @@ def upload_files_parallel(
         file_paths: List of local file paths to upload
         max_workers: Number of parallel upload threads
         dry_run: If True, only print what would be uploaded
+        first_page_only: If True, extract and upload only the first page of each PDF
     
     Returns:
         Stats dict with success/failed/skipped counts
@@ -243,7 +287,7 @@ def upload_files_parallel(
         futures = {}
         for path in file_paths:
             s3_key = generate_s3_key(path)
-            future = executor.submit(upload_single_file, s3_client, bucket_name, path, s3_key)
+            future = executor.submit(upload_single_file, s3_client, bucket_name, path, s3_key, first_page_only)
             futures[future] = path
         
         # Process results as they complete
@@ -269,6 +313,13 @@ def upload_files_parallel(
 def main():
     load_dotenv()
     
+    # Load E_FILES_BASE from environment
+    global E_FILES_BASE
+    E_FILES_BASE = os.getenv("E_FILES_BASE")
+    if not E_FILES_BASE:
+        print("Error: E_FILES_BASE not set in environment or .env file")
+        sys.exit(1)
+    
     parser = argparse.ArgumentParser(
         description="Upload E_Files PDFs to S3 with hash-based prefixes and multithreading."
     )
@@ -292,6 +343,11 @@ def main():
         "--analyze", "-a",
         action="store_true",
         help="Analyze page distribution without uploading (no S3 credentials needed)"
+    )
+    parser.add_argument(
+        "--first-page-only", "-1",
+        action="store_true",
+        help="Extract and upload only the first page of each PDF (requires pikepdf)"
     )
     args = parser.parse_args()
     
@@ -333,12 +389,16 @@ def main():
         analyze_page_distribution(all_pdf_files)
         sys.exit(0)
     
+    if args.first_page_only:
+        print("\nMode: First page only (extracting page 1 from each PDF)")
+    
     # Upload files
     stats = upload_files_parallel(
         bucket_name=bucket_name,
         file_paths=all_pdf_files,
         max_workers=args.workers,
-        dry_run=args.dry_run
+        dry_run=args.dry_run,
+        first_page_only=args.first_page_only
     )
     
     # Print summary

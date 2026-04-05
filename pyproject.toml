@@ -7,4 +7,5 @@ requires-python = ">=3.13"
 dependencies = [
     "boto3>=1.42.83",
     "dotenv>=0.9.9",
+    "pikepdf>=10.5.1",
 ]
