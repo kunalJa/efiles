@@ -359,9 +359,6 @@ def main():
     
     # Determine which volumes to process
     if args.volume is not None:
-        if args.volume == 9:
-            print("Error: Volume 9 does not exist")
-            sys.exit(1)
         volumes = [args.volume]
     else:
         volumes = ALL_VOLUMES
