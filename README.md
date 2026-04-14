@@ -2,8 +2,6 @@
 
 A serverless pipeline for managing and processing millions of PDF files stored in S3, with DynamoDB inventory tracking and Stripe/Shopify webhook integration for order fulfillment.
 
-> **Built with [uv](https://github.com/astral-sh/uv)** — the fast Python package manager
-
 ## Architecture Overview
 
 ```
@@ -75,28 +73,6 @@ Serverless function triggered by Stripe/Shopify webhooks to process orders.
 6. Upload transformed PDF to `ORDER/` prefix
 7. Update status to `READY_PRINT`
 
-**Environment Variables:**
-| Variable | Description |
-|----------|-------------|
-| `AWS_S3_BUCKET_NAME` | S3 bucket for PDFs |
-| `AWS_DYNAMO_DB_NAME` | Inventory table (e.g., `kz-pdf-files-db`) |
-| `AWS_DYNAMO_STORE_DB_NAME` | State table (e.g., `kz-pdf-files-store-state`) |
-
-**Supported Webhooks:**
-- Stripe: `checkout.session.completed`, `payment_intent.succeeded`
-- Shopify: Order creation webhook
-- Direct: `{"order_id": "test_123"}`
-
-### 4. Lambda Layer Builder (`build_lambda_layer.sh`)
-
-Builds a Lambda Layer with `pikepdf` and dependencies for Amazon Linux.
-
-```bash
-chmod +x build_lambda_layer.sh
-./build_lambda_layer.sh
-```
-
-**Output:** `pikepdf-layer.zip` — upload to AWS Lambda Layers.
 
 ### 5. CSV Combiner (`combine_csv.py`)
 
@@ -131,7 +107,7 @@ uv run combine_csv.py
 ### Prerequisites
 
 - [uv](https://github.com/astral-sh/uv) (Python package manager)
-- AWS CLI configured
+- AWS CLI configured or use ENV variables
 - Docker (for Lambda layer building)
 
 ### Installation
@@ -145,24 +121,13 @@ cd efiles
 uv sync
 ```
 
-### Environment Variables
-
-Create a `.env` file:
-
-```env
-E_FILES_BASE="/mnt/c/Users/kcube/Desktop/E_Files"
-AWS_S3_BUCKET_NAME="your-bucket-name"
-AWS_DYNAMO_DB_NAME="kz-pdf-files-db"
-AWS_DYNAMO_STORE_DB_NAME="kz-pdf-files-store-state"
-```
-
 ## Deployment
 
 ### Lambda Deployment
 
 1. Build the layer:
    ```bash
-   ./build_lambda_layer.sh
+   sudo ./build_lambda_layer.sh
    ```
 
 2. Upload `pikepdf-layer.zip` to AWS Lambda Layers
