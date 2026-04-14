@@ -1,1 +1,0 @@
-Hello, S3! This is a test file uploaded via boto3.
