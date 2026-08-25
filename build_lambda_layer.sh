@@ -1,27 +1,27 @@
 #!/bin/bash
-# Build pikepdf Lambda Layer using Docker (Amazon Linux 2)
+# Build the image-generation Lambda layer using the AWS SAM Python image
 #
 # Usage:
 #   chmod +x build_lambda_layer.sh
 #   ./build_lambda_layer.sh
 #
-# Output: pikepdf-layer.zip (upload to AWS Lambda Layers)
+# Output: print-images-layer.zip (upload to AWS Lambda Layers)
 
 set -e
 
-LAYER_NAME="pikepdf-layer"
+LAYER_NAME="print-images-layer"
 PYTHON_VERSION="3.13"
 
-echo "Building Lambda Layer for pikepdf..."
+echo "Building Lambda layer for PyMuPDF and Pillow..."
 
 # Create temp directory (use sudo to clean up root-owned files from Docker)
 sudo rm -rf layer_build 2>/dev/null || rm -rf layer_build
 mkdir -p layer_build/python
 
-# Build using Amazon Linux 2 (same as Lambda runtime)
-docker run --rm -v "$(pwd)/layer_build:/out" \
+# Build x86_64 Linux wheels matching the Lambda runtime
+docker run --rm --platform linux/amd64 -v "$(pwd)/layer_build:/out" \
     public.ecr.aws/sam/build-python${PYTHON_VERSION}:latest \
-    pip install pikepdf -t /out/python
+    pip install "PyMuPDF==1.28.2" "Pillow==12.2.0" -t /out/python
 
 # Fix permissions so we can zip (Docker creates as root)
 sudo chown -R $(id -u):$(id -g) layer_build

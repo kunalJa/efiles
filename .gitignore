@@ -33,3 +33,7 @@ credentials
 Thumbs.db
 
 pikepdf-layer.zip
+print-images-layer.zip
+lambda-order-processor.zip
+layer_build/
+out/

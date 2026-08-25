@@ -1,171 +1,293 @@
-# E-Files PDF Pipeline
+# E-Files Shirts Order Backend
 
-A serverless pipeline for managing and processing millions of PDF files stored in S3, with DynamoDB inventory tracking and Stripe/Shopify webhook integration for order fulfillment.
+Python tooling and AWS Lambda code for inventory allocation, Printful image
+creation, Stripe capture, and fulfillment submission.
 
-## Architecture Overview
+The canonical Next.js integration contract is
+[`../docs/BACKEND_INTEGRATION.md`](../docs/BACKEND_INTEGRATION.md).
 
-```
-┌─────────────────┐     ┌──────────────┐     ┌─────────────────┐
-│  Local E_Files  │────▶│   S3 Bucket  │◀────│  Lambda Order   │
-│   (3.5M PDFs)   │     │              │     │   Processor     │
-└─────────────────┘     └──────────────┘     └────────┬────────┘
-        │                      │                      │
-        ▼                      ▼                      ▼
-┌─────────────────┐     ┌──────────────┐     ┌─────────────────┐
-│  S3 Inventory   │────▶│  DynamoDB    │◀────│ Stripe/Shopify  │
-│    Report       │     │  Inventory   │     │    Webhook      │
-└─────────────────┘     └──────────────┘     └─────────────────┘
-```
+## Production order flow
 
-## Components
+The Lambda is invoked asynchronously after the signature-verified Next.js
+webhook route validates `checkout.session.completed` and its underlying
+manual-capture PaymentIntent.
 
-### 1. S3 Upload (`s3_upload.py`)
-
-Bulk upload PDFs from local storage to S3 with multithreading.
-
-```bash
-# Upload all volumes
-uv run s3_upload.py
-
-# Upload specific volume
-uv run s3_upload.py --volume 9
-
-# Dry run (list files without uploading)
-uv run s3_upload.py --dry-run
-
-# Upload only first page of each PDF
-uv run s3_upload.py --first-page-only
-
-# Analyze page distribution
-uv run s3_upload.py --analyze
+```text
+1. Re-fetch and validate the manual-capture Stripe PaymentIntent
+2. Atomically increment the global counter and claim an AVAILABLE inventory row
+3. Record the canonical inventory_id in Stripe metadata
+4. Render/upload 300-DPI front/back PNGs
+5. Create or reuse a Printful draft by unique external_id
+6. Capture Stripe
+7. Confirm Printful
+8. Mark the inventory row SOLD
 ```
 
-**Features:**
-- Multithreaded uploads (configurable workers)
-- First-page extraction using `pikepdf`
-- S3 key format: `VOL00001/filename.pdf`
+There is no API Gateway or public Lambda URL. The browser never invokes this
+Lambda and never queries DynamoDB directly.
 
-### 2. Inventory Preparation (`prepare_dynamo_import.py`)
+## Product configuration
 
-Prepares S3 inventory CSV for DynamoDB bulk import.
+White Gildan 5000, quantity 1, fixed `$44.00` USD product subtotal plus fixed
+`$4.75` Standard US shipping. Application tax calculation is disabled, so the
+Checkout total is exactly `$48.75`:
 
-```bash
-uv run prepare_dynamo_import.py
+| Size | Printful variant ID |
+|---|---:|
+| S | 11576 |
+| M | 11577 |
+| L | 11578 |
+| XL | 11579 |
+
+The front and back images are transparent 3600×4800 PNGs representing the
+12″×16″ print area at 300 DPI. They are stored at:
+
+```text
+ORDERS/<file_id>/front.png
+ORDERS/<file_id>/back.png
 ```
 
-**Features:**
-- Filters to PDF files only
-- Prioritizes 500 items from VOL00009/VOL00010 at the start
-- Shuffles remaining items randomly
-- Adds `ID` (sequential) and `Status` (`AVAILABLE`) columns
-- Outputs CSV ready for DynamoDB S3 import
+## DynamoDB schema
 
-### 3. Lambda Order Processor (`lambda_order_processor.py`)
-
-Serverless function triggered by Stripe/Shopify webhooks to process orders.
-
-**Flow:**
-1. Parse webhook event → extract OrderID
-2. Atomic increment `NextIdToSell` counter
-3. Claim item from inventory (status: `AVAILABLE` → `PROCESSING`)
-4. Download PDF from S3
-5. Apply transformation pipeline (rotate, watermark, etc.)
-6. Upload transformed PDF to `ORDER/` prefix
-7. Update status to `READY_PRINT`
-
-
-### 5. CSV Combiner (`combine_csv.py`)
-
-Combines multiple S3 inventory report CSVs into one.
-
-```bash
-uv run combine_csv.py
-```
-
-## DynamoDB Schema
-
-### Inventory Table (`kz-pdf-files-db`)
+### Inventory: `kz-pdf-files-db`
 
 | Attribute | Type | Description |
-|-----------|------|-------------|
-| `ID` | Number | Partition key (sequential) |
-| `S3Key` | String | S3 object key |
-| `Status` | String | `AVAILABLE`, `PROCESSING`, `READY_PRINT`, `FAILED` |
-| `OrderID` | String | Injected on purchase (sparse) |
-| `UpdatedAt` | String | ISO timestamp (sparse) |
-| `ErrorMessage` | String | Error details if failed (sparse) |
+|---|---|---|
+| `ID` | Number | Partition key |
+| `S3Key` | String | Source PDF key |
+| `Status` | String | Current lifecycle state |
+| `OrderID` | String | Sparse internal order ID; GSI partition key |
+| `PaymentIntentID` | String | Stripe PaymentIntent ID |
+| `ShirtSize` | String | S, M, L, or XL |
+| `PrintfulOrderID` | Number | Printful order ID |
+| `FrontS3Key` | String | Generated front PNG key |
+| `BackS3Key` | String | Generated back PNG key |
+| `StripePaymentStatus` | String | Stripe status after capture |
+| `PrintfulStatus` | String | Printful status after confirm |
+| `FileID` | String | Document ID exposed after success |
+| `UpdatedAt` | String | ISO-8601 status timestamp |
+| `ErrorMessage` | String | Truncated failure detail |
 
-### State Table (`kz-pdf-files-store-state`)
+Lifecycle:
 
-| Attribute | Type | Description |
-|-----------|------|-------------|
-| `pk` | String | Partition key (`global_counter`) |
-| `NextIdToSell` | Number | Atomic counter for next available item |
+```text
+AVAILABLE → PROCESSING → PRINTFUL_DRAFT_CREATED → PAYMENT_CAPTURED → SOLD
+                  └─ PROCESSING_RETRY                         └─ REFUNDED_FAILED
+                  └─ FAILED
+```
 
-## Setup
+Terminal-state conditional updates prevent duplicate invocations from
+regressing `SOLD`, `FAILED`, or `REFUNDED_FAILED`.
 
-### Prerequisites
+Create a sparse GSI:
 
-- [uv](https://github.com/astral-sh/uv) (Python package manager)
-- AWS CLI configured or use ENV variables
-- Docker (for Lambda layer building)
+```text
+Name:           OrderID-index
+Partition key:  OrderID (String)
+Projection:     INCLUDE Status, UpdatedAt, FileID, PrintfulOrderID,
+                PrintfulStatus, ErrorMessage, ShirtSize
+```
 
-### Installation
+The Next.js status route queries this index. Do not scan the roughly 3-million-
+row inventory table for browser polling.
+
+### Counter: `kz-pdf-files-store-state`
+
+This table contains exactly one row and no order records:
+
+```json
+{ "pk": "global_counter", "NextIdToSell": 5 }
+```
+
+`NextIdToSell=N` means claim inventory `ID=N`, then atomically store `N+1` for
+the next order. `ReturnValues="UPDATED_OLD"` returns the claimed ID.
+
+## Idempotency and duplicates
+
+Stripe and AWS async delivery can invoke the Lambda multiple times.
+
+- Stripe metadata `inventory_id` selects one canonical inventory row.
+- Concurrent claims converge on that canonical ID; extra rows can be orphaned
+  but no PDF is assigned to two completed orders.
+- Stable Stripe idempotency keys protect metadata update, capture, cancel, and
+  refund operations.
+- Capture is skipped when the PaymentIntent is already `succeeded`.
+- Printful is queried as `GET /orders/@<order_id>` before creation.
+- A concurrent Printful create conflict is followed by another lookup and full
+  external ID/variant validation.
+- Printful confirmation is skipped when the order is already past `draft`.
+
+## Fixed Checkout pricing
+
+Stripe-hosted Checkout displays a `$44.00` product line and a separate `$4.75`
+fixed shipping option, collects a US-only address, and creates a manual-capture
+PaymentIntent for exactly `$48.75`. No Lambda shipping quote is needed.
+
+The PaymentIntent must contain server-generated metadata for product (`4400`),
+shipping (`475`), tax (`0`), and shipping method (`STANDARD`). Lambda requires
+exact equality, USD currency, and a US address.
+
+The product price and Gildan 5000 cost are both fixed, and US Standard shipping
+is a flat `$4.75`, so the margin is deterministic at the configured price point.
+Lambda no longer polls Printful for `costs.total` or enforces a minimum-margin
+gate before capture; it captures immediately after the Printful draft is created
+and validated.
+
+## Image code versus the layer
+
+Production image-generation functions are directly in
+`lambda_order_processor.py`. `generate_printful_images.py` is only a local
+runner that imports those production functions; the Lambda does not import or
+deploy that runner.
+
+The `print-images-layer` contains only PyMuPDF and Pillow. These packages include
+Linux-native binaries and cannot be embedded into a single `.py` source file.
+AWS supports either bundling them in the function zip or placing them in a
+layer. The layer keeps code deployments small and can be rebuilt independently;
+it does not contain image assets or business logic.
+
+## Local verification
 
 ```bash
-# Clone the repo
-git clone https://github.com/yourusername/efiles.git
-cd efiles
-
-# Install dependencies (uv reads pyproject.toml automatically)
 uv sync
+uv run python -m unittest -v test_lambda_order_processor.py
+```
+
+Manual local image rendering:
+
+```bash
+LOCAL_PDF=/absolute/path/to/test.pdf SKIP_UPLOAD=1 \
+  uv run python generate_printful_images.py
 ```
 
 ## Deployment
 
-### Lambda Deployment
+### 1. Build the dependency layer
 
-1. Build the layer:
-   ```bash
-   sudo ./build_lambda_layer.sh
-   ```
+Requirements: Docker and `zip`.
 
-2. Upload `pikepdf-layer.zip` to AWS Lambda Layers
-
-3. Create Lambda function with:
-   - Runtime: Python 3.13
-   - Handler: `lambda_order_processor.lambda_handler`
-   - Attach the pikepdf layer
-   - Set environment variables
-   - IAM permissions: DynamoDB read/write, S3 read/write
-
-4. Create API Gateway trigger for webhooks
-
-### DynamoDB Import
-
-1. Run `uv run prepare_dynamo_import.py` to generate CSV
-2. Upload CSV to S3
-3. DynamoDB Console → Imports from S3
-4. Select CSV, enable "First row is header"
-5. Set partition key: `ID` (Number)
-
-## Transformation Pipeline
-
-Add custom PDF transformations in `lambda_order_processor.py`:
-
-```python
-def my_custom_transform(pdf_buffer: BytesIO) -> BytesIO:
-    """Your custom transformation."""
-    # Process pdf_buffer
-    return output_buffer
-
-# Add to pipeline
-DEFAULT_TRANSFORMATIONS = [
-    rotate_90_degrees,
-    my_custom_transform,  # Add here
-]
+```bash
+chmod +x build_lambda_layer.sh
+./build_lambda_layer.sh
 ```
 
-## License
+This creates `print-images-layer.zip` with Python 3.13 x86_64 Linux builds of
+PyMuPDF and Pillow. Create an AWS Lambda layer from the zip. If direct upload is
+too large, upload it to S3 and create the layer from that object.
 
-MIT
+### 2. Package application code
+
+```bash
+zip -j lambda-order-processor.zip lambda_order_processor.py
+```
+
+Only that Python file is needed in the application zip. Boto3 is supplied by
+the Lambda Python runtime; PyMuPDF and Pillow come from the attached layer.
+
+### 3. Create/configure the Lambda
+
+```text
+Function name:  efiles-order-processor
+Runtime:        Python 3.13
+Architecture:   x86_64
+Handler:        lambda_order_processor.lambda_handler
+Memory:         2048 MB
+Timeout:        300 seconds
+Code:           lambda-order-processor.zip
+Layer:          print-images-layer
+Public URL:     none
+API Gateway:    none
+```
+
+Configure async invocation with two retries, a bounded event age, and an SQS
+on-failure destination.
+
+### 4. Lambda environment
+
+| Variable | Required | Description |
+|---|---|---|
+| `AWS_S3_BUCKET_NAME` | yes | `kz-pdf-files-bucket` |
+| `AWS_DYNAMO_DB_NAME` | yes | `kz-pdf-files-db` |
+| `AWS_DYNAMO_STORE_DB_NAME` | yes | `kz-pdf-files-store-state` |
+| `STRIPE_SECRET_KEY_SECRET_ARN` | one of | Production Stripe secret ARN |
+| `STRIPE_SECRET_KEY` | one of | Plaintext only for local/dev |
+| `PRINTFUL_TOKEN_SECRET_ARN` | one of | Production Printful token ARN |
+| `PRINTFUL_TOKEN` | one of | Plaintext only for local/dev |
+| `PRINTFUL_STORE_ID` | optional | Needed for account-level token |
+| `ORDER_AMOUNT_CENTS` | optional | Fixed product subtotal; default `4400` |
+| `SHIPPING_AMOUNT_CENTS` | optional | Fixed US shipping; default `475` |
+| `SHIPPING_METHOD` | optional | Printful method; default `STANDARD` |
+| `PRESIGN_EXPIRES` | optional | Default `86400` seconds |
+
+Before production, verify Printful's published single-T-shirt US Standard rate
+is still `$4.75`; update both Checkout and Lambda configuration together if it
+changes. Stripe automatic tax is disabled for MVP.
+
+### 5. Lambda execution role
+
+Attach `AWSLambdaBasicExecutionRole` for CloudWatch Logs and add:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::kz-pdf-files-bucket/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem", "dynamodb:UpdateItem"],
+      "Resource": [
+        "arn:aws:dynamodb:us-east-1:800618367364:table/kz-pdf-files-db",
+        "arn:aws:dynamodb:us-east-1:800618367364:table/kz-pdf-files-store-state"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": [
+        "<STRIPE_SECRET_KEY_SECRET_ARN>",
+        "<PRINTFUL_TOKEN_SECRET_ARN>"
+      ]
+    }
+  ]
+}
+```
+
+Do not reuse the `s3-pdf-uploader` IAM user. Create a dedicated Lambda
+execution role.
+
+### 6. Next.js IAM role
+
+The separate Next.js/Vercel backend role needs only:
+
+- `lambda:InvokeFunction` on `efiles-order-processor`
+- `dynamodb:Query` on `kz-pdf-files-db/index/OrderID-index`
+
+Vercel OIDC is preferred over permanent AWS access keys. See
+`../docs/BACKEND_INTEGRATION.md` for the route contract and policy.
+
+## Orphan cleanup
+
+Automatic cleanup is safe only before Printful draft creation/capture:
+
+```bash
+# Dry run
+uv run python ../scripts/reclaim_stale_inventory.py --threshold-hours 24
+
+# Apply
+uv run python ../scripts/reclaim_stale_inventory.py --threshold-hours 24 --apply
+```
+
+The script only resets stale `PROCESSING` and `PROCESSING_RETRY` rows. Never
+blindly reclaim `PRINTFUL_DRAFT_CREATED` or `PAYMENT_CAPTURED`; reconcile those
+with Stripe and Printful first.
+
+## Other data-pipeline tools
+
+- `s3_upload.py`: bulk source PDF upload
+- `prepare_dynamo_import.py`: prepare inventory CSV for DynamoDB import
+- `combine_csv.py`: combine S3 inventory reports
+- `scripts/test_printful.py`: manual Printful draft testing
