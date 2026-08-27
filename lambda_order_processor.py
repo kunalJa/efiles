@@ -22,6 +22,7 @@ Environment Variables:
 - ORDER_AMOUNT_CENTS: fixed product subtotal before shipping (default 4400)
 - SHIPPING_AMOUNT_CENTS: fixed US Standard shipping (default 475)
 - SHIPPING_METHOD: Printful shipping method (default STANDARD)
+- CONFIRM_PRINTFUL_ORDERS: set true to submit drafts for fulfillment (default false)
 
 The production trigger should be a signature-verified Stripe
 checkout.session.completed webhook validated and forwarded asynchronously by
@@ -300,6 +301,10 @@ class RetryableOrderError(Exception):
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def printful_confirmation_enabled() -> bool:
+    return os.environ.get('CONFIRM_PRINTFUL_ORDERS', 'false').strip().lower() == 'true'
 
 
 def require_remaining_time(context, minimum_milliseconds: int, operation: str) -> None:
@@ -755,8 +760,18 @@ def lambda_handler(event, context):
         update_workflow_status(
             dynamodb, files_table, item_id,
             'PAYMENT_CAPTURED', PrintfulOrderID=printful_order_id)
-        require_remaining_time(context, 10000, 'Printful confirmation')
+        file_id = os.path.splitext(os.path.basename(item['S3Key']))[0]
+        if not printful_confirmation_enabled():
+            print(f'Printful confirmation disabled; leaving order {printful_order_id} as a draft')
+            update_workflow_status(
+                dynamodb, files_table, item_id, 'DRAFT_ONLY',
+                PrintfulOrderID=int(printful_order_id), StripePaymentStatus=captured['status'],
+                PrintfulStatus=printful_order['status'], FileID=file_id)
+            return {'statusCode': 200, 'body': json.dumps({
+                'order_id': order_id, 'item_id': item_id, 'file_id': file_id,
+                'printful_order_id': int(printful_order_id), 'status': 'DRAFT_ONLY'})}
 
+        require_remaining_time(context, 10000, 'Printful confirmation')
         try:
             confirmed = confirm_printful_order(
                 printful_token, int(printful_order_id), order_id)
@@ -768,7 +783,6 @@ def lambda_handler(event, context):
                 ErrorMessage='Printful confirmation failed after payment capture')
             raise
 
-        file_id = os.path.splitext(os.path.basename(item['S3Key']))[0]
         update_workflow_status(
             dynamodb, files_table, item_id, 'SOLD',
             PrintfulOrderID=int(printful_order_id), StripePaymentStatus=captured['status'],
