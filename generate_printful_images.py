@@ -34,7 +34,7 @@ def main() -> None:
     load_local_env()
     bucket = os.environ.get('AWS_S3_BUCKET_NAME', 'kz-pdf-files-bucket')
     pdf_s3_key = os.environ.get('PDF_S3_KEY', 'VOL00001/EFTA00000001.pdf')
-    expires = int(os.environ.get('PRESIGN_EXPIRES', '86400'))
+    asset_base_url = os.environ.get('PRINTFUL_ASSET_BASE_URL')
     local_pdf = os.environ.get('LOCAL_PDF')
     skip_upload = os.environ.get('SKIP_UPLOAD')
 
@@ -66,13 +66,13 @@ def main() -> None:
     import boto3
 
     result = generate_printful_images(
-        boto3.client('s3'), bucket, pdf_s3_key, expires)
+        boto3.client('s3'), bucket, pdf_s3_key, asset_base_url)
     print(json.dumps({
         key: value for key, value in result.items()
         if key.endswith('_key') or key == 'file_id'
     }, indent=2))
-    print(f"Front URL (expires in {expires}s): {result['front_url']}")
-    print(f"Back URL (expires in {expires}s): {result['back_url']}")
+    print(f"Front URL: {result['front_url']}")
+    print(f"Back URL: {result['back_url']}")
 
 
 if __name__ == '__main__':

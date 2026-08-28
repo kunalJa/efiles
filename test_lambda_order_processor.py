@@ -13,8 +13,8 @@ class OrderValidationTests(unittest.TestCase):
     def setUp(self):
         self.payment_intent = {
             'id': 'pi_test',
-            'amount': 4875,
-            'amount_capturable': 4875,
+            'amount': 4895,
+            'amount_capturable': 4895,
             'currency': 'usd',
             'capture_method': 'manual',
             'status': 'requires_capture',
@@ -24,7 +24,7 @@ class OrderValidationTests(unittest.TestCase):
                 'quantity': '1',
                 'customer_email': 'customer@example.com',
                 'product_amount_cents': '4400',
-                'shipping_amount_cents': '475',
+                'shipping_amount_cents': '495',
                 'tax_amount_cents': '0',
                 'shipping_method': 'STANDARD',
             },
@@ -114,18 +114,34 @@ class OrderValidationTests(unittest.TestCase):
         self.assertEqual(recipient['email'], 'customer@example.com')
 
 
+class LambdaHandlerTests(unittest.TestCase):
+    @patch.dict('os.environ', {
+        'AWS_S3_BUCKET_NAME': 'bucket',
+        'AWS_DYNAMO_DB_NAME': 'files',
+        'AWS_DYNAMO_STORE_DB_NAME': 'state',
+    }, clear=True)
+    @patch('builtins.print')
+    def test_logs_pre_claim_validation_failure(self, print_mock):
+        result = processor.lambda_handler({}, None)
+
+        self.assertEqual(result['statusCode'], 422)
+        print_mock.assert_called_once_with(
+            'Order validation failure for unknown: order_id and payment_intent_id are required')
+
+
 class SecretLoadingTests(unittest.TestCase):
     def tearDown(self):
         processor._SECRET_CACHE.clear()
 
-    @patch.dict('os.environ', {'TEST_SECRET_ARN': 'arn:test'}, clear=True)
+    @patch.dict('os.environ', {'PRINTFUL_TOKEN_SECRET_ARN': 'arn:printful'}, clear=True)
     @patch('lambda_order_processor.boto3.client')
-    def test_loads_key_from_json_secret(self, boto_client):
+    def test_loads_printful_key_from_json_secret(self, boto_client):
         boto_client.return_value.get_secret_value.return_value = {
-            'SecretString': '{"TEST_SECRET": "secret-value"}',
+            'SecretString': '{"PRINTFUL_SECRET_KEY": "secret-value"}',
         }
 
-        value = processor.get_secret('TEST_SECRET', 'TEST_SECRET_ARN')
+        value = processor.get_secret(
+            'PRINTFUL_SECRET_KEY', 'PRINTFUL_TOKEN_SECRET_ARN')
 
         self.assertEqual(value, 'secret-value')
 
@@ -199,7 +215,7 @@ class PrintfulIdempotencyTests(unittest.TestCase):
     def setUp(self):
         self.pricing = {
             'product_amount_cents': 4400,
-            'shipping_amount_cents': 475,
+            'shipping_amount_cents': 495,
             'tax_amount_cents': 0,
             'shipping_method': 'STANDARD',
         }
@@ -236,7 +252,7 @@ class PrintfulIdempotencyTests(unittest.TestCase):
         self.assertEqual(payload['items'][0]['variant_id'], 11577)
         self.assertEqual(payload['items'][0]['retail_price'], '44.00')
         self.assertEqual(payload['shipping'], 'STANDARD')
-        self.assertEqual(payload['retail_costs']['shipping'], '4.75')
+        self.assertEqual(payload['retail_costs']['shipping'], '4.95')
         self.assertEqual(payload['retail_costs']['tax'], '0.00')
 
     @patch('lambda_order_processor.printful_request')
@@ -280,6 +296,18 @@ class PrintfulIdempotencyTests(unittest.TestCase):
 
 
 class ImageGenerationTests(unittest.TestCase):
+    def test_upload_returns_short_public_asset_url(self):
+        s3_client = MagicMock()
+
+        url = processor.upload_print_file(
+            s3_client, 'bucket', 'ORDERS/file id/front.png', BytesIO(b'png'),
+            'https://bucket.s3.amazonaws.com/')
+
+        self.assertEqual(
+            url, 'https://bucket.s3.amazonaws.com/ORDERS/file%20id/front.png')
+        s3_client.upload_fileobj.assert_called_once()
+        s3_client.generate_presigned_url.assert_not_called()
+
     def test_front_and_back_are_300_dpi_pixel_dimensions(self):
         document = pymupdf.open()
         page = document.new_page(width=612, height=792)

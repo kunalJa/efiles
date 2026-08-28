@@ -29,8 +29,8 @@ Lambda and never queries DynamoDB directly.
 ## Product configuration
 
 White Gildan 5000, quantity 1, fixed `$44.00` USD product subtotal plus fixed
-`$4.75` Standard US shipping. Application tax calculation is disabled, so the
-Checkout total is exactly `$48.75`:
+`$4.95` Standard US shipping. Application tax calculation is disabled, so the
+Checkout total is exactly `$48.95`:
 
 | Size | Printful variant ID |
 |---|---:|
@@ -46,6 +46,35 @@ The front and back images are transparent 3600×4800 PNGs representing the
 ORDERS/<file_id>/front.png
 ORDERS/<file_id>/back.png
 ```
+
+Printful receives short public URLs for only this generated-image prefix because
+its API truncates Lambda-role S3 presigned URLs. Keep source PDFs outside
+`ORDERS/` private, deny bucket listing, and allow public `s3:GetObject` only on:
+
+```text
+arn:aws:s3:::kz-pdf-files-bucket/ORDERS/*
+```
+
+The previous Lambda-role presigned URLs exceeded Printful's 1,000-character
+source URL limit because they included an STS session token. Printful truncated
+the URLs before the required expiry parameter, so its exact stored URLs returned
+S3 `403 AccessDenied` and both files failed with zero size. Short unsigned URLs
+avoid that limit.
+
+These URLs contain no AWS credentials and grant no write or list access. They are
+still public: anyone who learns or guesses a path can download the generated
+image until it is deleted or the policy changes. Current file IDs are
+predictable, and public requests can create bandwidth cost if scraped. This is
+acceptable only while generated shirt artwork is non-sensitive. Use lifecycle
+deletion, random object paths, or private CloudFront delivery if requirements
+change. Never put source PDFs, customer data, or credentials under `ORDERS/`.
+
+Bucket versioning is suspended. A lifecycle rule scoped exactly to `ORDERS/`
+expires current generated-image versions 25 days after creation, making their
+public URLs unavailable. It does not delete Printful orders, Printful's ingested
+copies, DynamoDB records, Stripe payments, or private source PDFs outside that
+prefix. Historical noncurrent S3 versions remain unless the rule also includes a
+noncurrent-version expiration action.
 
 ## DynamoDB schema
 
@@ -119,16 +148,16 @@ Stripe and AWS async delivery can invoke the Lambda multiple times.
 
 ## Fixed Checkout pricing
 
-Stripe-hosted Checkout displays a `$44.00` product line and a separate `$4.75`
+Stripe-hosted Checkout displays a `$44.00` product line and a separate `$4.95`
 fixed shipping option, collects a US-only address, and creates a manual-capture
-PaymentIntent for exactly `$48.75`. No Lambda shipping quote is needed.
+PaymentIntent for exactly `$48.95`. No Lambda shipping quote is needed.
 
 The PaymentIntent must contain server-generated metadata for product (`4400`),
-shipping (`475`), tax (`0`), and shipping method (`STANDARD`). Lambda requires
+shipping (`495`), tax (`0`), and shipping method (`STANDARD`). Lambda requires
 exact equality, USD currency, and a US address.
 
 The product price and Gildan 5000 cost are both fixed, and US Standard shipping
-is a flat `$4.75`, so the margin is deterministic at the configured price point.
+is a flat `$4.95`, so the margin is deterministic at the configured price point.
 Lambda no longer polls Printful for `costs.total` or enforces a minimum-margin
 gate before capture; it captures immediately after the Printful draft is created
 and validated.
@@ -211,16 +240,16 @@ on-failure destination.
 | `AWS_DYNAMO_STORE_DB_NAME` | yes | `kz-pdf-files-store-state` |
 | `STRIPE_SECRET_KEY_SECRET_ARN` | one of | Production Stripe secret ARN |
 | `STRIPE_SECRET_KEY` | one of | Plaintext only for local/dev |
-| `PRINTFUL_TOKEN_SECRET_ARN` | one of | Production Printful token ARN |
-| `PRINTFUL_TOKEN` | one of | Plaintext only for local/dev |
+| `PRINTFUL_TOKEN_SECRET_ARN` | one of | Production Printful secret ARN containing `PRINTFUL_SECRET_KEY` |
+| `PRINTFUL_SECRET_KEY` | one of | Plaintext only for local/dev |
 | `PRINTFUL_STORE_ID` | optional | Needed for account-level token |
 | `ORDER_AMOUNT_CENTS` | optional | Fixed product subtotal; default `4400` |
-| `SHIPPING_AMOUNT_CENTS` | optional | Fixed US shipping; default `475` |
+| `SHIPPING_AMOUNT_CENTS` | optional | Fixed US shipping; default `495` |
 | `SHIPPING_METHOD` | optional | Printful method; default `STANDARD` |
-| `PRESIGN_EXPIRES` | optional | Default `86400` seconds |
+| `PRINTFUL_ASSET_BASE_URL` | optional | Public base URL for `ORDERS/*`; defaults to the bucket's S3 URL |
 
 Before production, verify Printful's published single-T-shirt US Standard rate
-is still `$4.75`; update both Checkout and Lambda configuration together if it
+is still `$4.95`; update both Checkout and Lambda configuration together if it
 changes. Stripe automatic tax is disabled for MVP.
 
 ### 5. Lambda execution role

@@ -17,11 +17,12 @@ Environment Variables:
 - AWS_DYNAMO_DB_NAME: DynamoDB inventory table
 - AWS_DYNAMO_STORE_DB_NAME: DynamoDB global-counter-only table
 - STRIPE_SECRET_KEY or STRIPE_SECRET_KEY_SECRET_ARN
-- PRINTFUL_TOKEN or PRINTFUL_TOKEN_SECRET_ARN
+- PRINTFUL_SECRET_KEY or PRINTFUL_TOKEN_SECRET_ARN
 - PRINTFUL_STORE_ID: optional for account-level Printful tokens
 - ORDER_AMOUNT_CENTS: fixed product subtotal before shipping (default 4400)
-- SHIPPING_AMOUNT_CENTS: fixed US Standard shipping (default 475)
+- SHIPPING_AMOUNT_CENTS: fixed US Standard shipping (default 495)
 - SHIPPING_METHOD: Printful shipping method (default STANDARD)
+- PRINTFUL_ASSET_BASE_URL: public base URL for generated ORDERS images
 - CONFIRM_PRINTFUL_ORDERS: set true to submit drafts for fulfillment (default false)
 
 The production trigger should be a signature-verified Stripe
@@ -122,31 +123,32 @@ def render_back_image(file_id: str) -> BytesIO:
     return output
 
 
-def upload_and_presign(s3_client, bucket: str, key: str,
-                       png_buffer: BytesIO, expires: int) -> str:
+def upload_print_file(s3_client, bucket: str, key: str,
+                      png_buffer: BytesIO, asset_base_url: str) -> str:
     png_buffer.seek(0)
     s3_client.upload_fileobj(
         png_buffer, bucket, key, ExtraArgs={'ContentType': 'image/png'})
-    return s3_client.generate_presigned_url(
-        'get_object', Params={'Bucket': bucket, 'Key': key}, ExpiresIn=expires)
+    encoded_key = urllib.parse.quote(key, safe='/')
+    return f"{asset_base_url.rstrip('/')}/{encoded_key}"
 
 
 def generate_printful_images(s3_client, bucket: str, pdf_s3_key: str,
-                             expires: int = 86400) -> dict:
+                             asset_base_url: Optional[str] = None) -> dict:
     file_id = file_id_from_key(pdf_s3_key)
     pdf_buffer = download_pdf_from_s3(s3_client, bucket, pdf_s3_key)
     front_png = render_front_image(pdf_buffer)
     back_png = render_back_image(file_id)
     front_key = f'{ORDERS_PREFIX}/{file_id}/front.png'
     back_key = f'{ORDERS_PREFIX}/{file_id}/back.png'
+    base_url = asset_base_url or f'https://{bucket}.s3.amazonaws.com'
     return {
         'file_id': file_id,
         'front_key': front_key,
         'back_key': back_key,
-        'front_url': upload_and_presign(
-            s3_client, bucket, front_key, front_png, expires),
-        'back_url': upload_and_presign(
-            s3_client, bucket, back_key, back_png, expires),
+        'front_url': upload_print_file(
+            s3_client, bucket, front_key, front_png, base_url),
+        'back_url': upload_print_file(
+            s3_client, bucket, back_key, back_png, base_url),
     }
 
 
@@ -454,7 +456,7 @@ def validate_payment(payment_intent: dict, order_id: str, requested_size: Option
     payment_order_id = metadata.get('order_id') or metadata.get('orderId')
     size = (metadata.get('size') or requested_size or '').upper()
     configured_product_amount = int(os.environ.get('ORDER_AMOUNT_CENTS', '4400'))
-    configured_shipping_amount = int(os.environ.get('SHIPPING_AMOUNT_CENTS', '475'))
+    configured_shipping_amount = int(os.environ.get('SHIPPING_AMOUNT_CENTS', '495'))
     configured_shipping_method = os.environ.get('SHIPPING_METHOD', 'STANDARD')
     pricing = payment_pricing(payment_intent)
     if not order_id or not re.fullmatch(r'[A-Za-z0-9_-]{1,32}', order_id):
@@ -690,6 +692,7 @@ def lambda_handler(event, context):
     if missing:
         raise PermanentOrderError(f"Missing environment variables: {', '.join(missing)}")
 
+    order_id = None
     try:
         payload = parse_event(event)
         order_id = payload.get('order_id')
@@ -700,7 +703,7 @@ def lambda_handler(event, context):
         dynamodb = boto3.resource('dynamodb')
         s3_client = boto3.client('s3')
         stripe_secret = get_secret('STRIPE_SECRET_KEY', 'STRIPE_SECRET_KEY_SECRET_ARN')
-        printful_token = get_secret('PRINTFUL_TOKEN', 'PRINTFUL_TOKEN_SECRET_ARN')
+        printful_token = get_secret('PRINTFUL_SECRET_KEY', 'PRINTFUL_TOKEN_SECRET_ARN')
         payment_intent = stripe_request('GET', f'/payment_intents/{payment_intent_id}', stripe_secret)
         inventory_id = payment_intent.get('metadata', {}).get('inventory_id')
         resume_item_id = int(inventory_id) if inventory_id else None
@@ -709,8 +712,10 @@ def lambda_handler(event, context):
             allow_succeeded=resume_item_id is not None)
         recipient = recipient_from_payment(payment_intent)
     except PermanentOrderError as error:
+        print(f"Order validation failure for {order_id or 'unknown'}: {error}")
         return {'statusCode': 422, 'body': json.dumps({'status': 'FAILED', 'message': str(error)})}
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        print(f"Malformed order event for {order_id or 'unknown'}: {error}")
         return {'statusCode': 400, 'body': json.dumps({'status': 'FAILED', 'message': str(error)})}
 
     item = None
@@ -739,7 +744,8 @@ def lambda_handler(event, context):
         printful_order_id = item.get('PrintfulOrderID')
         if not printful_order_id:
             image_result = generate_printful_images(
-                s3_client, bucket_name, item['S3Key'], int(os.environ.get('PRESIGN_EXPIRES', '86400')))
+                s3_client, bucket_name, item['S3Key'],
+                os.environ.get('PRINTFUL_ASSET_BASE_URL'))
             printful_order = get_or_create_printful_draft(
                 printful_token, order_id, recipient, GILDAN_5000_WHITE_VARIANTS[size],
                 image_result['front_url'], image_result['back_url'], pricing)
