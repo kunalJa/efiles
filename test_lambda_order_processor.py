@@ -1,6 +1,7 @@
+import json
 import unittest
 from io import BytesIO
-from unittest.mock import MagicMock, patch
+from unittest.mock import DEFAULT, MagicMock, patch
 
 import pymupdf
 from botocore.exceptions import ClientError
@@ -127,6 +128,42 @@ class LambdaHandlerTests(unittest.TestCase):
         self.assertEqual(result['statusCode'], 422)
         print_mock.assert_called_once_with(
             'Order validation failure for unknown: order_id and payment_intent_id are required')
+
+    @patch.dict('os.environ', {
+        'AWS_S3_BUCKET_NAME': 'bucket',
+        'AWS_DYNAMO_DB_NAME': 'files',
+        'AWS_DYNAMO_STORE_DB_NAME': 'state',
+    }, clear=True)
+    def test_draft_only_sends_confirmation_without_confirming_printful(self):
+        with patch.multiple('lambda_order_processor', **{
+            name: DEFAULT for name in (
+                'boto3', 'get_secret', 'stripe_request', 'validate_payment',
+                'recipient_from_payment', 'claim_order', 'payment_pricing',
+                'printful_request', 'validate_printful_order', 'capture_payment',
+                'update_workflow_status', 'send_order_confirmation',
+                'printful_confirmation_enabled', 'confirm_printful_order')
+        }) as mocks:
+            mocks['stripe_request'].return_value = {'metadata': {'inventory_id': '42'}}
+            mocks['validate_payment'].return_value = 'M'
+            mocks['recipient_from_payment'].return_value = {'email': 'customer@example.com'}
+            mocks['claim_order'].return_value = {
+                'ID': 42, 'Status': 'DRAFT_ONLY', 'PrintfulOrderID': 123,
+                'S3Key': 'VOL00001/EFTA00000042.pdf'}
+            mocks['payment_pricing'].return_value = {'total_amount_cents': 4895, 'shipping_method': 'STANDARD'}
+            mocks['printful_request'].return_value = {'status': 'draft'}
+            mocks['validate_printful_order'].return_value = {'status': 'draft'}
+            mocks['capture_payment'].return_value = {'status': 'succeeded'}
+            mocks['printful_confirmation_enabled'].return_value = False
+
+            result = processor.lambda_handler({
+                'order_id': 'order_test', 'payment_intent_id': 'pi_test', 'size': 'M'}, None)
+
+            self.assertEqual(json.loads(result['body'])['status'], 'DRAFT_ONLY')
+            mocks['send_order_confirmation'].assert_called_once_with(
+                mocks['boto3'].resource.return_value, 'files', 42, 'order_test',
+                {'email': 'customer@example.com'}, 'M',
+                {'total_amount_cents': 4895, 'shipping_method': 'STANDARD'})
+            mocks['confirm_printful_order'].assert_not_called()
 
 
 class SecretLoadingTests(unittest.TestCase):
@@ -318,12 +355,14 @@ class EmailTests(unittest.TestCase):
                          'Product: $44.00\n'
                          'Shipping: $4.95\n'
                          'Total charged: $48.95\n\n'
-                         'Your order has been submitted for fulfillment. Tracking is not available until it ships. '
+                         'Your order has been submitted for fulfillment. '
                          'Check the latest status and tracking here: https://mysteryfile.store/orders/order_test\n\n'
-                         'Questions? Reply to this email or write to support@mysteryfile.store.\n')
+                         'Questions? Write to support@mysteryfile.store.\n')
         self.assertEqual(table.update_item.call_count, 2)
-        self.assertIn('attribute_not_exists(ConfirmationEmailSentAt)',
-                      table.update_item.call_args_list[0].kwargs['ConditionExpression'])
+        claim = table.update_item.call_args_list[0].kwargs
+        self.assertIn('attribute_not_exists(ConfirmationEmailSentAt)', claim['ConditionExpression'])
+        self.assertIn('#status IN (:sold, :draft)', claim['ConditionExpression'])
+        self.assertEqual(claim['ExpressionAttributeValues'][':draft'], 'DRAFT_ONLY')
 
     @patch.dict('os.environ', {'SES_FROM_EMAIL': 'noreply@mysteryfile.store',
                                 'ORDER_SITE_URL': 'https://mysteryfile.store',

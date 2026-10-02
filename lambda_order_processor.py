@@ -696,10 +696,11 @@ def send_order_confirmation(dynamodb, table_name: str, item_id: int,
         table.update_item(
             Key={'ID': item_id},
             UpdateExpression='SET ConfirmationEmailClaimedAt = :claim',
-            ConditionExpression=('#status = :sold AND attribute_not_exists(ConfirmationEmailSentAt) '
+            ConditionExpression=('#status IN (:sold, :draft) AND attribute_not_exists(ConfirmationEmailSentAt) '
                                  'AND (attribute_not_exists(ConfirmationEmailClaimedAt) OR ConfirmationEmailClaimedAt < :cutoff)'),
             ExpressionAttributeNames={'#status': 'Status'},
-            ExpressionAttributeValues={':sold': 'SOLD', ':claim': claim, ':cutoff': cutoff})
+            ExpressionAttributeValues={':sold': 'SOLD', ':draft': 'DRAFT_ONLY',
+                                       ':claim': claim, ':cutoff': cutoff})
     except ClientError as error:
         if error.response.get('Error', {}).get('Code') == 'ConditionalCheckFailedException':
             return
@@ -710,7 +711,7 @@ def send_order_confirmation(dynamodb, table_name: str, item_id: int,
             f'Product: ${pricing["product_amount_cents"] / 100:.2f}\n'
             f'Shipping: ${pricing["shipping_amount_cents"] / 100:.2f}\n'
             f'Total charged: ${pricing["total_amount_cents"] / 100:.2f}\n\n'
-            'Your order has been submitted for fulfillment.'
+            'Your order has been submitted for fulfillment. '
             f'Check the latest status and tracking here: {order_url}\n\n'
             f'Questions? Write to {support_email}.\n')
     try:
@@ -729,6 +730,7 @@ def send_order_confirmation(dynamodb, table_name: str, item_id: int,
                       UpdateExpression='SET ConfirmationEmailSentAt = :sent REMOVE ConfirmationEmailClaimedAt',
                       ConditionExpression='ConfirmationEmailClaimedAt = :claim',
                       ExpressionAttributeValues={':sent': utc_now(), ':claim': claim})
+    print(f'Confirmation email accepted by SES for order {order_id}')
 
 
 # ============================================================================
@@ -828,6 +830,7 @@ def lambda_handler(event, context):
                 dynamodb, files_table, item_id, 'DRAFT_ONLY',
                 PrintfulOrderID=int(printful_order_id), StripePaymentStatus=captured['status'],
                 PrintfulStatus=printful_order['status'], FileID=file_id)
+            send_order_confirmation(dynamodb, files_table, item_id, order_id, recipient, size, pricing)
             return {'statusCode': 200, 'body': json.dumps({
                 'order_id': order_id, 'item_id': item_id, 'file_id': file_id,
                 'printful_order_id': int(printful_order_id), 'status': 'DRAFT_ONLY'})}
