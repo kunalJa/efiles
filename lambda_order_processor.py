@@ -377,7 +377,8 @@ def request_json(method: str, url: str, headers: dict, data=None, retries: int =
                 details = json.loads(response_body)
             except json.JSONDecodeError:
                 details = {'message': response_body or error.reason}
-            if error.code == 429 or error.code >= 500:
+            if (error.code == 429 or error.code >= 500
+                    or (error.code == 409 and url.startswith(f'{STRIPE_API_BASE}/'))):
                 if attempt + 1 < retries:
                     time.sleep(2 ** attempt)
                     continue
@@ -493,6 +494,8 @@ def validate_payment(payment_intent: dict, order_id: str, requested_size: Option
         raise PermanentOrderError(f"PaymentIntent is not capturable: {status}")
     if status == 'requires_capture' and int(payment_intent.get('amount_capturable', 0)) < payment_amount:
         raise PermanentOrderError('PaymentIntent does not have the full amount available to capture')
+    if bool(payment_intent.get('livemode')) != printful_confirmation_enabled():
+        raise PermanentOrderError('Stripe live/test mode must match CONFIRM_PRINTFUL_ORDERS')
     return size
 
 
@@ -668,13 +671,28 @@ def refund_payment(secret_key: str, payment_intent_id: str, order_id: str) -> No
 
 
 def confirm_printful_order(token: str, printful_order_id: int, order_id: str) -> dict:
-    order = printful_request('GET', f'/orders/{printful_order_id}', token)
+    try:
+        order = printful_request('GET', f'/orders/{printful_order_id}', token)
+    except PermanentOrderError as error:
+        raise RetryableOrderError('Unable to verify Printful confirmation status') from error
     if order.get('external_id') != order_id:
         raise PermanentOrderError('Printful order external_id does not match this order')
     if order.get('status') == 'draft':
-        return printful_request('POST', f'/orders/{printful_order_id}/confirm', token, {})
+        try:
+            order = printful_request('POST', f'/orders/{printful_order_id}/confirm', token, {})
+        except PermanentOrderError as confirm_error:
+            try:
+                order = printful_request('GET', f'/orders/{printful_order_id}', token)
+            except PermanentOrderError as error:
+                raise RetryableOrderError('Unable to reconcile Printful confirmation') from error
+            if order.get('status') == 'draft':
+                raise confirm_error
+    if order.get('external_id') != order_id:
+        raise PermanentOrderError('Printful order external_id does not match this order')
     if order.get('status') in ('failed', 'canceled'):
         raise PermanentOrderError(f"Printful order is {order.get('status')}")
+    if order.get('status') == 'draft':
+        raise RetryableOrderError('Printful order is still a draft after confirmation')
     return order
 
 
@@ -702,9 +720,13 @@ def send_order_confirmation(dynamodb, table_name: str, item_id: int,
             ExpressionAttributeValues={':sold': 'SOLD', ':draft': 'DRAFT_ONLY',
                                        ':claim': claim, ':cutoff': cutoff})
     except ClientError as error:
-        if error.response.get('Error', {}).get('Code') == 'ConditionalCheckFailedException':
+        if error.response.get('Error', {}).get('Code') != 'ConditionalCheckFailedException':
+            raise
+        item = table.get_item(Key={'ID': item_id}, ConsistentRead=True,
+                              ProjectionExpression='ConfirmationEmailSentAt').get('Item') or {}
+        if item.get('ConfirmationEmailSentAt'):
             return
-        raise
+        raise RetryableOrderError('Confirmation email has no completed send; retry after the active claim expires') from error
     order_url = f"{site_url.rstrip('/')}/orders/{order_id}"
     body = (f'Thank you for your order!\n\nOrder reference: {order_id}\n'
             f'Mystery File T-Shirt, size {size}, quantity 1\n'
@@ -768,12 +790,13 @@ def lambda_handler(event, context):
         recipient = recipient_from_payment(payment_intent)
     except PermanentOrderError as error:
         print(f"Order validation failure for {order_id or 'unknown'}: {error}")
-        return {'statusCode': 422, 'body': json.dumps({'status': 'FAILED', 'message': str(error)})}
+        raise
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         print(f"Malformed order event for {order_id or 'unknown'}: {error}")
-        return {'statusCode': 400, 'body': json.dumps({'status': 'FAILED', 'message': str(error)})}
+        raise
 
     item = None
+    printful_order = None
     try:
         item = claim_order(
             dynamodb, files_table, state_table, order_id, payment_intent_id,
@@ -813,9 +836,9 @@ def lambda_handler(event, context):
                 FrontS3Key=image_result['front_key'], BackS3Key=image_result['back_key'])
 
         require_remaining_time(context, 30000, 'payment capture and Printful confirmation')
-        printful_order = validate_printful_order(
-            printful_request('GET', f'/orders/{int(printful_order_id)}', printful_token),
-            order_id, GILDAN_5000_WHITE_VARIANTS[size], pricing['shipping_method'])
+        printful_order = printful_request('GET', f'/orders/{int(printful_order_id)}', printful_token)
+        validate_printful_order(
+            printful_order, order_id, GILDAN_5000_WHITE_VARIANTS[size], pricing['shipping_method'])
         payment_intent = stripe_request(
             'GET', f'/payment_intents/{payment_intent_id}', stripe_secret)
         validate_payment(payment_intent, order_id, size, 1, allow_succeeded=True)
@@ -871,9 +894,14 @@ def lambda_handler(event, context):
                 update_workflow_status(
                     dynamodb, files_table, int(item['ID']),
                     'FAILED', ErrorMessage=str(error)[:500])
+            elif (printful_order and printful_order.get('external_id') == order_id
+                  and printful_order.get('status') in ('failed', 'canceled')):
+                refund_payment(stripe_secret, payment_intent_id, order_id)
+                update_workflow_status(
+                    dynamodb, files_table, int(item['ID']),
+                    'REFUNDED_FAILED', ErrorMessage='Printful order failed after payment capture')
         print(f"Permanent order failure for {order_id}: {error}")
-        return {'statusCode': 422, 'body': json.dumps({
-            'order_id': order_id, 'status': 'FAILED', 'message': str(error)})}
+        raise
     except Exception as error:
         if item:
             update_workflow_status(

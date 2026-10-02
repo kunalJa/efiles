@@ -1,5 +1,6 @@
 import json
 import unittest
+import urllib.error
 from io import BytesIO
 from unittest.mock import DEFAULT, MagicMock, patch
 
@@ -14,6 +15,7 @@ class OrderValidationTests(unittest.TestCase):
     def setUp(self):
         self.payment_intent = {
             'id': 'pi_test',
+            'livemode': False,
             'amount': 4895,
             'amount_capturable': 4895,
             'currency': 'usd',
@@ -58,6 +60,22 @@ class OrderValidationTests(unittest.TestCase):
     def test_validates_manual_capture_payment(self):
         self.assertEqual(
             processor.validate_payment(self.payment_intent, 'order_test', 'M', 1), 'M')
+
+    @patch.dict('os.environ', {'CONFIRM_PRINTFUL_ORDERS': 'true'})
+    def test_test_payment_cannot_submit_real_fulfillment(self):
+        with self.assertRaises(processor.PermanentOrderError):
+            processor.validate_payment(self.payment_intent, 'order_test', 'M', 1)
+
+    @patch.dict('os.environ', {'CONFIRM_PRINTFUL_ORDERS': 'false'})
+    def test_live_payment_cannot_be_captured_for_a_draft_only_order(self):
+        self.payment_intent['livemode'] = True
+        with self.assertRaises(processor.PermanentOrderError):
+            processor.validate_payment(self.payment_intent, 'order_test', 'M', 1)
+
+    @patch.dict('os.environ', {'CONFIRM_PRINTFUL_ORDERS': 'true'})
+    def test_live_payment_can_submit_real_fulfillment(self):
+        self.payment_intent['livemode'] = True
+        self.assertEqual(processor.validate_payment(self.payment_intent, 'order_test', 'M', 1), 'M')
 
     def test_supports_large_and_extra_large(self):
         for size in ('L', 'XL'):
@@ -123,9 +141,9 @@ class LambdaHandlerTests(unittest.TestCase):
     }, clear=True)
     @patch('builtins.print')
     def test_logs_pre_claim_validation_failure(self, print_mock):
-        result = processor.lambda_handler({}, None)
+        with self.assertRaises(processor.PermanentOrderError):
+            processor.lambda_handler({}, None)
 
-        self.assertEqual(result['statusCode'], 422)
         print_mock.assert_called_once_with(
             'Order validation failure for unknown: order_id and payment_intent_id are required')
 
@@ -164,6 +182,38 @@ class LambdaHandlerTests(unittest.TestCase):
                 {'email': 'customer@example.com'}, 'M',
                 {'total_amount_cents': 4895, 'shipping_method': 'STANDARD'})
             mocks['confirm_printful_order'].assert_not_called()
+
+    @patch.dict('os.environ', {
+        'AWS_S3_BUCKET_NAME': 'bucket',
+        'AWS_DYNAMO_DB_NAME': 'files',
+        'AWS_DYNAMO_STORE_DB_NAME': 'state',
+    }, clear=True)
+    def test_captured_order_that_failed_before_retry_is_refunded_and_raises(self):
+        with patch.multiple('lambda_order_processor', **{
+            name: DEFAULT for name in (
+                'boto3', 'get_secret', 'stripe_request', 'validate_payment',
+                'recipient_from_payment', 'claim_order', 'payment_pricing',
+                'printful_request', 'update_workflow_status', 'refund_payment',
+                'capture_payment', 'send_order_confirmation')
+        }) as mocks:
+            mocks['stripe_request'].return_value = {'status': 'succeeded', 'metadata': {'inventory_id': '42'}}
+            mocks['validate_payment'].return_value = 'M'
+            mocks['claim_order'].return_value = {
+                'ID': 42, 'Status': 'PROCESSING_RETRY', 'PrintfulOrderID': 123,
+                'S3Key': 'VOL00001/EFTA00000042.pdf'}
+            mocks['payment_pricing'].return_value = {'shipping_method': 'STANDARD'}
+            mocks['printful_request'].return_value = {
+                'id': 123, 'external_id': 'order_test', 'status': 'failed',
+                'items': [{'variant_id': 11577}], 'shipping': 'STANDARD'}
+
+            with self.assertRaises(processor.PermanentOrderError):
+                processor.lambda_handler({
+                    'order_id': 'order_test', 'payment_intent_id': 'pi_test', 'size': 'M'}, None)
+
+            mocks['refund_payment'].assert_called_once()
+            self.assertEqual(mocks['update_workflow_status'].call_args.args[3], 'REFUNDED_FAILED')
+            mocks['capture_payment'].assert_not_called()
+            mocks['send_order_confirmation'].assert_not_called()
 
 
 class SecretLoadingTests(unittest.TestCase):
@@ -325,11 +375,68 @@ class PrintfulIdempotencyTests(unittest.TestCase):
 
         self.assertEqual(assigned_id, 42)
 
+    @patch('lambda_order_processor.printful_request')
+    def test_confirmation_race_reuses_order_confirmed_by_other_invocation(self, request):
+        draft = {'id': 123, 'external_id': 'order_test', 'status': 'draft'}
+        confirmed = {**draft, 'status': 'pending'}
+        request.side_effect = [
+            draft, processor.PermanentOrderError('HTTP 400: order already confirmed'), confirmed]
+
+        result = processor.confirm_printful_order('token', 123, 'order_test')
+
+        self.assertEqual(result, confirmed)
+        self.assertEqual(request.call_args.args[:2], ('GET', '/orders/123'))
+
+    @patch('lambda_order_processor.printful_request')
+    def test_confirmation_rejects_failed_success_response(self, request):
+        draft = {'id': 123, 'external_id': 'order_test', 'status': 'draft'}
+        request.side_effect = [draft, {**draft, 'status': 'failed'}]
+
+        with self.assertRaises(processor.PermanentOrderError):
+            processor.confirm_printful_order('token', 123, 'order_test')
+
+    @patch('lambda_order_processor.printful_request')
+    def test_confirmation_does_not_call_a_remaining_draft_sold(self, request):
+        draft = {'id': 123, 'external_id': 'order_test', 'status': 'draft'}
+        request.side_effect = [draft, draft]
+
+        with self.assertRaises(processor.RetryableOrderError):
+            processor.confirm_printful_order('token', 123, 'order_test')
+
+    @patch('lambda_order_processor.printful_request')
+    def test_confirmation_preserves_a_real_permanent_rejection(self, request):
+        draft = {'id': 123, 'external_id': 'order_test', 'status': 'draft'}
+        request.side_effect = [draft, processor.PermanentOrderError('HTTP 400: invalid print file'), draft]
+
+        with self.assertRaises(processor.PermanentOrderError):
+            processor.confirm_printful_order('token', 123, 'order_test')
+
+    @patch('lambda_order_processor.printful_request')
+    def test_confirmation_does_not_refund_when_reconciliation_is_unavailable(self, request):
+        draft = {'id': 123, 'external_id': 'order_test', 'status': 'draft'}
+        request.side_effect = [draft, processor.PermanentOrderError('HTTP 400'),
+                               processor.PermanentOrderError('HTTP 403')]
+
+        with self.assertRaises(processor.RetryableOrderError):
+            processor.confirm_printful_order('token', 123, 'order_test')
+
     @patch('lambda_order_processor.stripe_request')
     def test_capture_is_not_repeated_after_success(self, request):
         payment_intent = {'id': 'pi_test', 'status': 'succeeded'}
         self.assertIs(processor.capture_payment('secret', payment_intent, 'order_test'), payment_intent)
         request.assert_not_called()
+
+
+class RequestRetryTests(unittest.TestCase):
+    @patch('lambda_order_processor.time.sleep')
+    @patch('lambda_order_processor.urllib.request.urlopen')
+    def test_stripe_idempotency_conflict_is_retryable(self, urlopen, sleep):
+        url = f'{processor.STRIPE_API_BASE}/payment_intents/pi_test/capture'
+        urlopen.side_effect = urllib.error.HTTPError(
+            url, 409, 'Conflict', {}, BytesIO(b'{"error":{"code":"idempotency_key_in_use"}}'))
+
+        with self.assertRaises(processor.RetryableOrderError):
+            processor.request_json('POST', url, {}, {}, retries=1)
 
 
 class EmailTests(unittest.TestCase):
@@ -364,12 +471,46 @@ class EmailTests(unittest.TestCase):
         self.assertIn('#status IN (:sold, :draft)', claim['ConditionExpression'])
         self.assertEqual(claim['ExpressionAttributeValues'][':draft'], 'DRAFT_ONLY')
 
+    @patch.dict('os.environ', {}, clear=True)
+    @patch('lambda_order_processor.boto3.client')
+    def test_ses_failure_releases_the_claim_and_raises(self, client):
+        client.return_value.send_email.side_effect = ClientError(
+            {'Error': {'Code': 'MessageRejected'}}, 'SendEmail')
+        table = MagicMock()
+        dynamodb = MagicMock()
+        dynamodb.Table.return_value = table
+        pricing = {'product_amount_cents': 4400, 'shipping_amount_cents': 495,
+                   'total_amount_cents': 4895}
+
+        with self.assertRaises(ClientError):
+            processor.send_order_confirmation(dynamodb, 'files', 42, 'order_test',
+                                              {'email': 'customer@example.com'}, 'M', pricing)
+
+        self.assertEqual(table.update_item.call_args.kwargs['UpdateExpression'], 'REMOVE ConfirmationEmailClaimedAt')
+        self.assertEqual(table.update_item.call_count, 2)
+
+    @patch.dict('os.environ', {}, clear=True)
+    @patch('lambda_order_processor.boto3.client')
+    def test_unsent_active_email_claim_raises_instead_of_silently_succeeding(self, client):
+        table = MagicMock()
+        table.update_item.side_effect = ClientError(
+            {'Error': {'Code': 'ConditionalCheckFailedException'}}, 'UpdateItem')
+        table.get_item.return_value = {'Item': {'Status': 'SOLD', 'ConfirmationEmailClaimedAt': processor.utc_now()}}
+        dynamodb = MagicMock()
+        dynamodb.Table.return_value = table
+
+        with self.assertRaises(processor.RetryableOrderError):
+            processor.send_order_confirmation(dynamodb, 'files', 42, 'order_test',
+                                              {'email': 'customer@example.com'}, 'M', {})
+        client.assert_not_called()
+
     @patch.dict('os.environ', {'SES_FROM_EMAIL': 'noreply@mysteryfile.store',
                                 'ORDER_SITE_URL': 'https://mysteryfile.store',
                                 'SUPPORT_EMAIL': 'support@mysteryfile.store'}, clear=True)
     @patch('lambda_order_processor.boto3.client')
     def test_confirmation_is_not_resent_when_claim_fails(self, client):
         table = MagicMock()
+        table.get_item.return_value = {'Item': {'ConfirmationEmailSentAt': processor.utc_now()}}
         table.update_item.side_effect = ClientError(
             {'Error': {'Code': 'ConditionalCheckFailedException'}}, 'UpdateItem')
         dynamodb = MagicMock()
