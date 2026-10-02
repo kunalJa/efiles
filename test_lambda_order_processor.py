@@ -295,6 +295,51 @@ class PrintfulIdempotencyTests(unittest.TestCase):
         request.assert_not_called()
 
 
+class EmailTests(unittest.TestCase):
+    @patch.dict('os.environ', {}, clear=True)
+    @patch('lambda_order_processor.boto3.client')
+    def test_confirmation_sends_order_link_and_records_delivery(self, client):
+        table = MagicMock()
+        dynamodb = MagicMock()
+        dynamodb.Table.return_value = table
+        pricing = {'product_amount_cents': 4400, 'shipping_amount_cents': 495,
+                   'total_amount_cents': 4895}
+        processor.send_order_confirmation(dynamodb, 'files', 42, 'order_test',
+                                          {'email': 'customer@example.com'}, 'M', pricing)
+        message = client.return_value.send_email.call_args.kwargs
+        self.assertEqual(message['Source'], 'noreply@mysteryfile.store')
+        self.assertEqual(message['ReplyToAddresses'], ['support@mysteryfile.store'])
+        self.assertEqual(message['Destination']['ToAddresses'], ['customer@example.com'])
+        self.assertEqual(message['Message']['Subject']['Data'], 'Your Mystery File order order_test')
+        self.assertEqual(message['Message']['Body']['Text']['Data'],
+                         'Thank you for your order!\n\n'
+                         'Order reference: order_test\n'
+                         'Mystery File T-Shirt, size M, quantity 1\n'
+                         'Product: $44.00\n'
+                         'Shipping: $4.95\n'
+                         'Total charged: $48.95\n\n'
+                         'Your order has been submitted for fulfillment. Tracking is not available until it ships. '
+                         'Check the latest status and tracking here: https://mysteryfile.store/orders/order_test\n\n'
+                         'Questions? Reply to this email or write to support@mysteryfile.store.\n')
+        self.assertEqual(table.update_item.call_count, 2)
+        self.assertIn('attribute_not_exists(ConfirmationEmailSentAt)',
+                      table.update_item.call_args_list[0].kwargs['ConditionExpression'])
+
+    @patch.dict('os.environ', {'SES_FROM_EMAIL': 'noreply@mysteryfile.store',
+                                'ORDER_SITE_URL': 'https://mysteryfile.store',
+                                'SUPPORT_EMAIL': 'support@mysteryfile.store'}, clear=True)
+    @patch('lambda_order_processor.boto3.client')
+    def test_confirmation_is_not_resent_when_claim_fails(self, client):
+        table = MagicMock()
+        table.update_item.side_effect = ClientError(
+            {'Error': {'Code': 'ConditionalCheckFailedException'}}, 'UpdateItem')
+        dynamodb = MagicMock()
+        dynamodb.Table.return_value = table
+        processor.send_order_confirmation(dynamodb, 'files', 42, 'order_test',
+                                          {'email': 'customer@example.com'}, 'M', {})
+        client.assert_not_called()
+
+
 class ImageGenerationTests(unittest.TestCase):
     def test_upload_returns_short_public_asset_url(self):
         s3_client = MagicMock()

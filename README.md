@@ -21,6 +21,7 @@ manual-capture PaymentIntent.
 6. Capture Stripe
 7. Confirm Printful
 8. Mark the inventory row SOLD
+9. Send a customer confirmation via SES with a link to the order page
 ```
 
 There is no API Gateway or public Lambda URL. The browser never invokes this
@@ -96,6 +97,8 @@ noncurrent-version expiration action.
 | `FileID` | String | Document ID exposed after success |
 | `UpdatedAt` | String | ISO-8601 status timestamp |
 | `ErrorMessage` | String | Truncated failure detail |
+| `ConfirmationEmailClaimedAt` | String | Temporary SES send lease; expires after five minutes |
+| `ConfirmationEmailSentAt` | String | SES accepted the confirmation email |
 
 Lifecycle:
 
@@ -145,6 +148,7 @@ Stripe and AWS async delivery can invoke the Lambda multiple times.
 - A concurrent Printful create conflict is followed by another lookup and full
   external ID/variant validation.
 - Printful confirmation is skipped when the order is already past `draft`.
+- SES confirmation uses a DynamoDB conditional send lease; a retry of a SOLD order can send if the prior send failed. SES has no idempotency key, so a crash after SES accepts mail but before `ConfirmationEmailSentAt` is recorded can result in a duplicate after the lease expires. Monitor send errors and reconcile these cases.
 
 ## Fixed Checkout pricing
 
@@ -242,11 +246,15 @@ on-failure destination.
 | `STRIPE_SECRET_KEY` | one of | Plaintext only for local/dev |
 | `PRINTFUL_TOKEN_SECRET_ARN` | one of | Production Printful secret ARN containing `PRINTFUL_SECRET_KEY` |
 | `PRINTFUL_SECRET_KEY` | one of | Plaintext only for local/dev |
-| `PRINTFUL_STORE_ID` | optional | Needed for account-level token |
+| `PRINTFUL_STORE_ID` | optional | Numeric store ID for account-level token; not the `mysteryfile` display name |
 | `ORDER_AMOUNT_CENTS` | optional | Fixed product subtotal; default `4400` |
 | `SHIPPING_AMOUNT_CENTS` | optional | Fixed US shipping; default `495` |
 | `SHIPPING_METHOD` | optional | Printful method; default `STANDARD` |
 | `PRINTFUL_ASSET_BASE_URL` | optional | Public base URL for `ORDERS/*`; defaults to the bucket's S3 URL |
+| `SES_FROM_EMAIL` | optional | Verified SES sender; defaults to `noreply@mysteryfile.store` |
+| `ORDER_SITE_URL` | optional | HTTPS site origin; defaults to `https://mysteryfile.store` |
+| `SUPPORT_EMAIL` | optional | Reply-To address backed by a real inbox; defaults to `support@mysteryfile.store` |
+| `SES_REGION` | optional | SES identity region; defaults to `us-east-1` |
 
 Before production, verify Printful's published single-T-shirt US Standard rate
 is still `$4.95`; update both Checkout and Lambda configuration together if it
@@ -272,6 +280,11 @@ Attach `AWSLambdaBasicExecutionRole` for CloudWatch Logs and add:
         "arn:aws:dynamodb:us-east-1:800618367364:table/kz-pdf-files-db",
         "arn:aws:dynamodb:us-east-1:800618367364:table/kz-pdf-files-store-state"
       ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "ses:SendEmail",
+      "Resource": "arn:aws:ses:us-east-1:800618367364:identity/mysteryfile.store"
     },
     {
       "Effect": "Allow",

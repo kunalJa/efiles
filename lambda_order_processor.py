@@ -41,7 +41,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from io import BytesIO
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from botocore.exceptions import ClientError
 
@@ -678,6 +678,59 @@ def confirm_printful_order(token: str, printful_order_id: int, order_id: str) ->
     return order
 
 
+def send_order_confirmation(dynamodb, table_name: str, item_id: int,
+                            order_id: str, recipient: dict, size: str, pricing: dict) -> None:
+    sender = os.environ.get('SES_FROM_EMAIL', 'noreply@mysteryfile.store')
+    site_url = os.environ.get('ORDER_SITE_URL', 'https://mysteryfile.store')
+    support_email = os.environ.get('SUPPORT_EMAIL', 'support@mysteryfile.store')
+    if not all(re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email)
+               for email in (sender, support_email)):
+        raise RetryableOrderError('SES_FROM_EMAIL or SUPPORT_EMAIL is invalid')
+    parsed = urllib.parse.urlparse(site_url)
+    if parsed.scheme != 'https' or not parsed.netloc or parsed.username or parsed.password or parsed.path not in ('', '/') or parsed.query or parsed.fragment:
+        raise RetryableOrderError('ORDER_SITE_URL must be an HTTPS origin')
+    table = dynamodb.Table(table_name)
+    claim = utc_now()
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    try:
+        table.update_item(
+            Key={'ID': item_id},
+            UpdateExpression='SET ConfirmationEmailClaimedAt = :claim',
+            ConditionExpression=('#status = :sold AND attribute_not_exists(ConfirmationEmailSentAt) '
+                                 'AND (attribute_not_exists(ConfirmationEmailClaimedAt) OR ConfirmationEmailClaimedAt < :cutoff)'),
+            ExpressionAttributeNames={'#status': 'Status'},
+            ExpressionAttributeValues={':sold': 'SOLD', ':claim': claim, ':cutoff': cutoff})
+    except ClientError as error:
+        if error.response.get('Error', {}).get('Code') == 'ConditionalCheckFailedException':
+            return
+        raise
+    order_url = f"{site_url.rstrip('/')}/orders/{order_id}"
+    body = (f'Thank you for your order!\n\nOrder reference: {order_id}\n'
+            f'Mystery File T-Shirt, size {size}, quantity 1\n'
+            f'Product: ${pricing["product_amount_cents"] / 100:.2f}\n'
+            f'Shipping: ${pricing["shipping_amount_cents"] / 100:.2f}\n'
+            f'Total charged: ${pricing["total_amount_cents"] / 100:.2f}\n\n'
+            'Your order has been submitted for fulfillment.'
+            f'Check the latest status and tracking here: {order_url}\n\n'
+            f'Questions? Write to {support_email}.\n')
+    try:
+        boto3.client('ses', region_name=os.environ.get('SES_REGION', 'us-east-1')).send_email(
+            Source=sender, Destination={'ToAddresses': [recipient['email']]},
+            ReplyToAddresses=[support_email],
+            Message={'Subject': {'Data': f'Your Mystery File order {order_id}', 'Charset': 'UTF-8'},
+                     'Body': {'Text': {'Data': body, 'Charset': 'UTF-8'}}})
+    except Exception:
+        table.update_item(Key={'ID': item_id},
+                          UpdateExpression='REMOVE ConfirmationEmailClaimedAt',
+                          ConditionExpression='ConfirmationEmailClaimedAt = :claim',
+                          ExpressionAttributeValues={':claim': claim})
+        raise
+    table.update_item(Key={'ID': item_id},
+                      UpdateExpression='SET ConfirmationEmailSentAt = :sent REMOVE ConfirmationEmailClaimedAt',
+                      ConditionExpression='ConfirmationEmailClaimedAt = :claim',
+                      ExpressionAttributeValues={':sent': utc_now(), ':claim': claim})
+
+
 # ============================================================================
 # LAMBDA HANDLER
 # ============================================================================
@@ -733,6 +786,8 @@ def lambda_handler(event, context):
                     size, assigned_item_id)
                 item_id = assigned_item_id
         if item.get('Status') == 'SOLD':
+            send_order_confirmation(dynamodb, files_table, item_id, order_id, recipient,
+                                    size, payment_pricing(payment_intent))
             return {'statusCode': 200, 'body': json.dumps({
                 'order_id': order_id, 'item_id': item_id,
                 'file_id': item.get('FileID'),
@@ -793,6 +848,7 @@ def lambda_handler(event, context):
             dynamodb, files_table, item_id, 'SOLD',
             PrintfulOrderID=int(printful_order_id), StripePaymentStatus=captured['status'],
             PrintfulStatus=confirmed['status'], FileID=file_id)
+        send_order_confirmation(dynamodb, files_table, item_id, order_id, recipient, size, pricing)
         return {'statusCode': 200, 'body': json.dumps({
             'order_id': order_id, 'item_id': item_id, 'file_id': file_id,
             'printful_order_id': int(printful_order_id), 'status': 'SOLD'})}
