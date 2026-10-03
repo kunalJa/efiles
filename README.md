@@ -21,7 +21,7 @@ manual-capture PaymentIntent.
 6. Capture Stripe
 7. Confirm Printful
 8. Mark the inventory row SOLD
-9. Send a customer confirmation via SES with a link to the order page
+9. Send a customer confirmation via Resend with a link to the order page
 ```
 
 There is no API Gateway or public Lambda URL. The browser never invokes this
@@ -97,8 +97,8 @@ noncurrent-version expiration action.
 | `FileID` | String | Document ID exposed after success |
 | `UpdatedAt` | String | ISO-8601 status timestamp |
 | `ErrorMessage` | String | Truncated failure detail |
-| `ConfirmationEmailClaimedAt` | String | Temporary SES send lease; expires after five minutes |
-| `ConfirmationEmailSentAt` | String | SES accepted the confirmation email |
+| `ConfirmationEmailClaimedAt` | String | Temporary email send lease; expires after five minutes |
+| `ConfirmationEmailSentAt` | String | Sending provider accepted the confirmation email; not proof of inbox delivery |
 
 Lifecycle:
 
@@ -109,7 +109,7 @@ AVAILABLE → PROCESSING → PRINTFUL_DRAFT_CREATED → PAYMENT_CAPTURED → SOL
 ```
 
 Terminal-state conditional updates prevent duplicate invocations from
-regressing `SOLD`, `FAILED`, or `REFUNDED_FAILED`.
+regressing `SOLD`, `DRAFT_ONLY`, `FAILED`, or `REFUNDED_FAILED`.
 
 Create a sparse GSI:
 
@@ -148,7 +148,8 @@ Stripe and AWS async delivery can invoke the Lambda multiple times.
 - A concurrent Printful create conflict is followed by another lookup and full
   external ID/variant validation.
 - Printful confirmation is skipped when the order is already past `draft`.
-- SES confirmation uses a DynamoDB conditional send lease; a retry of a SOLD order can send if the prior send failed. SES has no idempotency key, so a crash after SES accepts mail but before `ConfirmationEmailSentAt` is recorded can result in a duplicate after the lease expires. Monitor send errors and reconcile these cases.
+- Confirmation email uses a DynamoDB conditional send lease; a retry of a SOLD or DRAFT_ONLY order goes directly to the email step if the prior send failed. Resend also receives the stable `order-confirmation/<order_id>` idempotency key, retained by Resend for 24 hours. A crash after provider acceptance but before `ConfirmationEmailSentAt` is recorded can still produce a duplicate after that window; SES has no provider-side idempotency key. Monitor send errors and reconcile these cases.
+- Resend is the default sender; set `ORDER_EMAIL_PROVIDER=ses` to select the retained SES implementation. There is no automatic fallback between providers. Email failures release the lease and still raise for Lambda retries and alarms. Email exceptions bypass order-failure handling, leaving `SOLD` or `DRAFT_ONLY` intact without triggering capture, confirmation, cancellation, or refund again. No separate email-status field or public failure message is added. The existing `ConfirmationEmailSentAt` attribute indicates provider acceptance; completed rows without it can be inspected in the base table without changing the GSI. Later retries recover the recipient from the Stripe PaymentIntent.
 
 ## Fixed Checkout pricing
 
@@ -251,10 +252,16 @@ on-failure destination.
 | `SHIPPING_AMOUNT_CENTS` | optional | Fixed US shipping; default `495` |
 | `SHIPPING_METHOD` | optional | Printful method; default `STANDARD` |
 | `PRINTFUL_ASSET_BASE_URL` | optional | Public base URL for `ORDERS/*`; defaults to the bucket's S3 URL |
-| `SES_FROM_EMAIL` | optional | Verified SES sender; defaults to `noreply@mysteryfile.store` |
+| `ORDER_EMAIL_PROVIDER` | optional | `resend` (default) or `ses` |
+| `RESEND_SECRET_KEY_SECRET_ARN` | one of for Resend | Resend secret ARN or name; set to `efiles/resend/production`, whose JSON must contain `RESEND_SECRET_KEY` |
+| `RESEND_SECRET_KEY` | one of for Resend | Plaintext only for local/dev |
+| `RESEND_FROM_EMAIL` | optional | Resend-verified sender; defaults to `SES_FROM_EMAIL` or `noreply@mysteryfile.store` |
+| `SES_FROM_EMAIL` | optional | SES sender and fallback address for Resend; defaults to `noreply@mysteryfile.store` |
 | `ORDER_SITE_URL` | optional | HTTPS site origin; defaults to `https://mysteryfile.store` |
 | `SUPPORT_EMAIL` | optional | Reply-To address backed by a real inbox; defaults to `support@mysteryfile.store` |
 | `SES_REGION` | optional | SES identity region; defaults to `us-east-1` |
+
+Verify the sending domain in Resend and grant the Lambda role `secretsmanager:GetSecretValue` on the ARN for `efiles/resend/production` in the Lambda's AWS region (`us-east-1`). No Resend SDK or dependency-layer rebuild is required. SES permissions and identity are needed only if the SES path is selected.
 
 Before production, verify Printful's published single-T-shirt US Standard rate
 is still `$4.95`; update both Checkout and Lambda configuration together if it
@@ -291,7 +298,8 @@ Attach `AWSLambdaBasicExecutionRole` for CloudWatch Logs and add:
       "Action": "secretsmanager:GetSecretValue",
       "Resource": [
         "<STRIPE_SECRET_KEY_SECRET_ARN>",
-        "<PRINTFUL_TOKEN_SECRET_ARN>"
+        "<PRINTFUL_TOKEN_SECRET_ARN>",
+        "<RESEND_SECRET_KEY_SECRET_ARN>"
       ]
     }
   ]

@@ -216,6 +216,86 @@ class LambdaHandlerTests(unittest.TestCase):
             mocks['send_order_confirmation'].assert_not_called()
 
 
+class CompletedOrderEmailTests(unittest.TestCase):
+    def setUp(self):
+        env = patch.dict('os.environ', {
+            'AWS_S3_BUCKET_NAME': 'bucket', 'AWS_DYNAMO_DB_NAME': 'files',
+            'AWS_DYNAMO_STORE_DB_NAME': 'state'}, clear=True)
+        env.start()
+        self.addCleanup(env.stop)
+        dependencies = patch.multiple('lambda_order_processor', **{
+            name: DEFAULT for name in (
+                'boto3', 'get_secret', 'stripe_request', 'validate_payment',
+                'recipient_from_payment', 'claim_order', 'payment_pricing',
+                'generate_printful_images', 'get_or_create_printful_draft',
+                'printful_request', 'validate_printful_order', 'capture_payment',
+                'update_workflow_status', 'send_order_confirmation',
+                'printful_confirmation_enabled', 'confirm_printful_order',
+                'refund_payment', 'cancel_payment')})
+        self.mocks = dependencies.start()
+        self.addCleanup(dependencies.stop)
+        self.mocks['stripe_request'].return_value = {
+            'status': 'succeeded', 'metadata': {'inventory_id': '42'}}
+        self.mocks['validate_payment'].return_value = 'M'
+        self.mocks['recipient_from_payment'].return_value = {'email': 'customer@example.com'}
+        self.item = {'ID': 42, 'Status': 'DRAFT_ONLY', 'PrintfulOrderID': 123,
+                     'S3Key': 'VOL00001/EFTA00000042.pdf', 'FileID': 'EFTA00000042'}
+        self.mocks['claim_order'].return_value = self.item
+        self.mocks['payment_pricing'].return_value = {
+            'total_amount_cents': 4895, 'shipping_method': 'STANDARD'}
+        self.mocks['printful_request'].return_value = {'status': 'draft'}
+        self.mocks['capture_payment'].return_value = {'status': 'succeeded'}
+        self.mocks['confirm_printful_order'].return_value = {'status': 'pending'}
+        self.mocks['printful_confirmation_enabled'].return_value = False
+
+    def invoke(self):
+        return processor.lambda_handler({
+            'order_id': 'order_test', 'payment_intent_id': 'pi_test', 'size': 'M'}, None)
+
+    def test_completed_order_retry_only_attempts_email(self):
+        for status in ('SOLD', 'DRAFT_ONLY'):
+            with self.subTest(status=status):
+                self.item['Status'] = status
+                result = self.invoke()
+                self.assertEqual(json.loads(result['body'])['status'], status)
+                self.mocks['send_order_confirmation'].assert_called()
+                for name in ('generate_printful_images', 'get_or_create_printful_draft',
+                             'printful_request', 'capture_payment', 'confirm_printful_order',
+                             'update_workflow_status', 'refund_payment', 'cancel_payment'):
+                    self.mocks[name].assert_not_called()
+
+    def test_email_failure_after_completion_raises_without_changing_order(self):
+        for status in ('SOLD', 'DRAFT_ONLY'):
+            for error in (RuntimeError('sender failed'),
+                          processor.RetryableOrderError('active email claim'),
+                          processor.PermanentOrderError('email configuration'),
+                          ClientError({'Error': {'Code': 'MessageRejected'}}, 'SendEmail')):
+                with self.subTest(status=status, error=type(error).__name__):
+                    self.item['Status'] = status
+                    self.mocks['send_order_confirmation'].side_effect = error
+                    with self.assertRaises(processor.ConfirmationEmailError) as raised:
+                        self.invoke()
+                    self.assertIs(raised.exception.__cause__, error)
+                    for name in ('update_workflow_status', 'capture_payment',
+                                 'confirm_printful_order', 'refund_payment', 'cancel_payment'):
+                        self.mocks[name].assert_not_called()
+
+    def test_first_completion_remains_saved_when_email_fails(self):
+        for confirm, expected_status in ((False, 'DRAFT_ONLY'), (True, 'SOLD')):
+            with self.subTest(status=expected_status):
+                self.item['Status'] = 'PRINTFUL_DRAFT_CREATED'
+                self.mocks['printful_confirmation_enabled'].return_value = confirm
+                self.mocks['send_order_confirmation'].side_effect = RuntimeError('email failed')
+                update = self.mocks['update_workflow_status']
+                update.reset_mock()
+                with self.assertRaises(processor.ConfirmationEmailError):
+                    self.invoke()
+                self.assertEqual([call.args[3] for call in update.call_args_list],
+                                 ['PAYMENT_CAPTURED', expected_status])
+                self.mocks['refund_payment'].assert_not_called()
+                self.mocks['cancel_payment'].assert_not_called()
+
+
 class SecretLoadingTests(unittest.TestCase):
     def tearDown(self):
         processor._SECRET_CACHE.clear()
@@ -295,6 +375,8 @@ class WorkflowStatusTests(unittest.TestCase):
         self.assertFalse(updated)
         condition = table.update_item.call_args.kwargs['ConditionExpression']
         self.assertIn(':sold', condition)
+        self.assertIn(':draft', condition)
+        self.assertEqual(table.update_item.call_args.kwargs['ExpressionAttributeValues'][':draft'], 'DRAFT_ONLY')
         self.assertIn(':refunded', condition)
 
 
@@ -439,8 +521,145 @@ class RequestRetryTests(unittest.TestCase):
             processor.request_json('POST', url, {}, {}, retries=1)
 
 
-class EmailTests(unittest.TestCase):
+class ResendEmailTests(unittest.TestCase):
+    def setUp(self):
+        client_patch = patch('lambda_order_processor.boto3.client')
+        client_patch.start()
+        self.addCleanup(client_patch.stop)
+        self.table = MagicMock()
+        self.dynamodb = MagicMock()
+        self.dynamodb.Table.return_value = self.table
+        self.pricing = {'product_amount_cents': 4400, 'shipping_amount_cents': 495,
+                        'total_amount_cents': 4895}
+
+    def tearDown(self):
+        processor._SECRET_CACHE.clear()
+
+    def send(self):
+        processor.send_order_confirmation(self.dynamodb, 'files', 42, 'order_test',
+                                          {'email': 'customer@example.com'}, 'M', self.pricing)
+
+    @patch.dict('os.environ', {'RESEND_SECRET_KEY_SECRET_ARN': 'efiles/resend/production'}, clear=True)
+    @patch('lambda_order_processor.request_json')
+    @patch('lambda_order_processor.boto3.client')
+    def test_default_sender_uses_resend_and_named_json_secret(self, client, request):
+        client.return_value.get_secret_value.return_value = {
+            'SecretString': '{"RESEND_SECRET_KEY": "test-resend-key"}'}
+        request.return_value = {'id': 'email_test'}
+
+        self.send()
+
+        client.assert_called_once_with('secretsmanager')
+        client.return_value.get_secret_value.assert_called_once_with(SecretId='efiles/resend/production')
+        method, url, headers, message = request.call_args.args
+        self.assertEqual((method, url), ('POST', 'https://api.resend.com/emails'))
+        self.assertEqual(headers['Authorization'], 'Bearer test-resend-key')
+        self.assertEqual(headers['Idempotency-Key'], 'order-confirmation/order_test')
+        self.assertEqual(message['from'], 'noreply@mysteryfile.store')
+        self.assertEqual(message['to'], ['customer@example.com'])
+        self.assertEqual(message['reply_to'], ['support@mysteryfile.store'])
+        self.assertEqual(message['subject'], 'Your Mystery File order order_test')
+        self.assertIn('Total charged: $48.95', message['text'])
+        self.assertIn('https://mysteryfile.store/orders/order_test', message['text'])
+        self.assertIn('ConfirmationEmailSentAt', self.table.update_item.call_args.kwargs['UpdateExpression'])
+        client.return_value.send_email.assert_not_called()
+
+    @patch.dict('os.environ', {'RESEND_SECRET_KEY': 'test-key',
+                              'RESEND_FROM_EMAIL': 'orders@mysteryfile.store'}, clear=True)
+    @patch('lambda_order_processor.request_json', return_value={'id': 'email_test'})
+    @patch('lambda_order_processor.boto3.client')
+    def test_resend_sender_override_and_local_key(self, client, request):
+        self.send()
+        self.assertEqual(request.call_args.args[3]['from'], 'orders@mysteryfile.store')
+        client.assert_not_called()
+
+    @patch.dict('os.environ', {'RESEND_SECRET_KEY': 'test-key'}, clear=True)
+    @patch('lambda_order_processor.request_json')
+    def test_resend_failure_releases_claim_and_does_not_raise_order_validation_error(self, request):
+        request.side_effect = processor.PermanentOrderError('HTTP 403: private-provider-detail')
+        with self.assertRaisesRegex(RuntimeError, 'Resend confirmation request failed') as raised:
+            self.send()
+        self.assertNotIn('private-provider-detail', str(raised.exception))
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(self.table.update_item.call_args.kwargs['UpdateExpression'],
+                         'REMOVE ConfirmationEmailClaimedAt')
+
+    @patch.dict('os.environ', {'RESEND_SECRET_KEY': 'test-key'}, clear=True)
+    @patch('lambda_order_processor.request_json')
+    def test_resend_response_requires_a_message_id(self, request):
+        for response in ({}, {'id': ''}, {'id': 123}, {'error': 'rejected'}, None):
+            with self.subTest(response=response):
+                request.return_value = response
+                with self.assertRaisesRegex(RuntimeError, 'Resend did not accept'):
+                    self.send()
+                self.assertEqual(self.table.update_item.call_args.kwargs['UpdateExpression'],
+                                 'REMOVE ConfirmationEmailClaimedAt')
+
+    @patch.dict('os.environ', {'RESEND_SECRET_KEY_SECRET_ARN': 'arn:resend'}, clear=True)
+    @patch('lambda_order_processor.request_json', return_value={'id': 'email_test'})
+    @patch('lambda_order_processor.boto3.client')
+    def test_resend_secret_arn_is_supported(self, client, request):
+        client.return_value.get_secret_value.return_value = {
+            'SecretString': '{"RESEND_SECRET_KEY": "test-key"}'}
+        self.send()
+        client.return_value.get_secret_value.assert_called_once_with(SecretId='arn:resend')
+
+    @patch.dict('os.environ', {'RESEND_SECRET_KEY_SECRET_ARN': 'efiles/resend/production'}, clear=True)
+    @patch('lambda_order_processor.request_json')
+    @patch('lambda_order_processor.boto3.client')
+    def test_missing_resend_key_releases_claim_and_raises(self, client, request):
+        client.return_value.get_secret_value.return_value = {'SecretString': '{}'}
+        with self.assertRaisesRegex(RuntimeError, 'Unable to load Resend sending credentials'):
+            self.send()
+        request.assert_not_called()
+        self.assertEqual(self.table.update_item.call_args.kwargs['UpdateExpression'],
+                         'REMOVE ConfirmationEmailClaimedAt')
+
+
     @patch.dict('os.environ', {}, clear=True)
+    @patch('lambda_order_processor.request_json')
+    @patch('lambda_order_processor.boto3.client')
+    def test_resend_requires_explicit_secret_configuration(self, client, request):
+        with self.assertRaisesRegex(RuntimeError, 'Unable to load Resend sending credentials'):
+            self.send()
+        client.assert_not_called()
+        request.assert_not_called()
+        self.assertEqual(self.table.update_item.call_args.kwargs['UpdateExpression'],
+                         'REMOVE ConfirmationEmailClaimedAt')
+
+    @patch.dict('os.environ', {'RESEND_SECRET_KEY': 'test-key'}, clear=True)
+    @patch('lambda_order_processor.time.sleep')
+    @patch('lambda_order_processor.urllib.request.urlopen')
+    def test_transient_resend_errors_retry_with_the_same_idempotency_key(self, urlopen, sleep):
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"id":"email_test"}'
+        urlopen.side_effect = [
+            urllib.error.HTTPError('https://api.resend.com/emails', 429, 'Rate limited', {}, BytesIO(b'{}')),
+            urllib.error.HTTPError('https://api.resend.com/emails', 503, 'Unavailable', {}, BytesIO(b'{}')),
+            response,
+        ]
+        self.send()
+        self.assertEqual(urlopen.call_count, 3)
+        for call in urlopen.call_args_list:
+            self.assertEqual(call.args[0].get_header('Idempotency-key'), 'order-confirmation/order_test')
+            self.assertEqual(call.kwargs['timeout'], 20)
+        self.assertIn('ConfirmationEmailSentAt', self.table.update_item.call_args.kwargs['UpdateExpression'])
+
+    @patch.dict('os.environ', {'RESEND_SECRET_KEY': 'test-key'}, clear=True)
+    @patch('lambda_order_processor.urllib.request.urlopen')
+    def test_http_rejection_keeps_status_code_without_provider_details(self, urlopen):
+        urlopen.side_effect = urllib.error.HTTPError(
+            'https://api.resend.com/emails', 403, 'Forbidden', {},
+            BytesIO(b'{"message":"private-provider-detail"}'))
+        with self.assertRaisesRegex(RuntimeError, 'HTTP 403') as raised:
+            self.send()
+        self.assertNotIn('private-provider-detail', str(raised.exception))
+        self.assertIsNone(raised.exception.__cause__)
+        urlopen.assert_called_once()
+
+
+class EmailTests(unittest.TestCase):
+    @patch.dict('os.environ', {'ORDER_EMAIL_PROVIDER': 'ses'}, clear=True)
     @patch('lambda_order_processor.boto3.client')
     def test_confirmation_sends_order_link_and_records_delivery(self, client):
         table = MagicMock()
@@ -471,7 +690,7 @@ class EmailTests(unittest.TestCase):
         self.assertIn('#status IN (:sold, :draft)', claim['ConditionExpression'])
         self.assertEqual(claim['ExpressionAttributeValues'][':draft'], 'DRAFT_ONLY')
 
-    @patch.dict('os.environ', {}, clear=True)
+    @patch.dict('os.environ', {'ORDER_EMAIL_PROVIDER': 'ses'}, clear=True)
     @patch('lambda_order_processor.boto3.client')
     def test_ses_failure_releases_the_claim_and_raises(self, client):
         client.return_value.send_email.side_effect = ClientError(

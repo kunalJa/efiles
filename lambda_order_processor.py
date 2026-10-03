@@ -301,6 +301,10 @@ class RetryableOrderError(Exception):
     pass
 
 
+class ConfirmationEmailError(Exception):
+    pass
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -550,6 +554,7 @@ def update_workflow_status(dynamodb, files_table: str,
         ':status': status,
         ':now': now,
         ':sold': 'SOLD',
+        ':draft': 'DRAFT_ONLY',
         ':failed': 'FAILED',
         ':refunded': 'REFUNDED_FAILED',
     }
@@ -568,7 +573,7 @@ def update_workflow_status(dynamodb, files_table: str,
             Key={'ID': item_id}, UpdateExpression=update_expression,
             ConditionExpression=(
                 'attribute_not_exists(#status) OR '
-                'NOT (#status IN (:sold, :failed, :refunded)) OR #status = :status'),
+                'NOT (#status IN (:sold, :draft, :failed, :refunded)) OR #status = :status'),
             ExpressionAttributeNames=names, ExpressionAttributeValues=values)
         return True
     except ClientError as error:
@@ -696,14 +701,55 @@ def confirm_printful_order(token: str, printful_order_id: int, order_id: str) ->
     return order
 
 
+def send_confirmation_ses(sender: str, recipient_email: str, support_email: str,
+                          subject: str, body: str, order_id: str) -> None:
+    boto3.client('ses', region_name=os.environ.get('SES_REGION', 'us-east-1')).send_email(
+        Source=sender, Destination={'ToAddresses': [recipient_email]},
+        ReplyToAddresses=[support_email],
+        Message={'Subject': {'Data': subject, 'Charset': 'UTF-8'},
+                 'Body': {'Text': {'Data': body, 'Charset': 'UTF-8'}}})
+
+
+def send_confirmation_resend(sender: str, recipient_email: str, support_email: str,
+                             subject: str, body: str, order_id: str) -> None:
+    try:
+        token = get_secret('RESEND_SECRET_KEY', 'RESEND_SECRET_KEY_SECRET_ARN')
+    except (PermanentOrderError, ClientError, KeyError, ValueError):
+        raise RuntimeError('Unable to load Resend sending credentials') from None
+    if not isinstance(token, str) or not token.strip():
+        raise RuntimeError('Unable to load Resend sending credentials')
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json',
+        'User-Agent': 'e-files-shirts-lambda/1.0',
+        'Idempotency-Key': f'order-confirmation/{order_id}',
+    }
+    try:
+        response = request_json('POST', 'https://api.resend.com/emails', headers, {
+            'from': sender, 'to': [recipient_email], 'reply_to': [support_email],
+            'subject': subject, 'text': body,
+        })
+    except (PermanentOrderError, RetryableOrderError, ValueError, TimeoutError) as error:
+        cause = error.__cause__
+        status = f' (HTTP {cause.code})' if isinstance(cause, urllib.error.HTTPError) else ''
+        raise RuntimeError(f'Resend confirmation request failed{status}; check provider configuration and availability') from None
+    if not isinstance(response, dict) or not isinstance(response.get('id'), str) or not response['id']:
+        raise RuntimeError('Resend did not accept the confirmation email')
+
+
 def send_order_confirmation(dynamodb, table_name: str, item_id: int,
                             order_id: str, recipient: dict, size: str, pricing: dict) -> None:
+    provider = os.environ.get('ORDER_EMAIL_PROVIDER', 'resend').strip().lower()
+    if provider not in ('resend', 'ses'):
+        raise RuntimeError('ORDER_EMAIL_PROVIDER must be resend or ses')
     sender = os.environ.get('SES_FROM_EMAIL', 'noreply@mysteryfile.store')
+    if provider == 'resend':
+        sender = os.environ.get('RESEND_FROM_EMAIL', sender)
     site_url = os.environ.get('ORDER_SITE_URL', 'https://mysteryfile.store')
     support_email = os.environ.get('SUPPORT_EMAIL', 'support@mysteryfile.store')
     if not all(re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email)
                for email in (sender, support_email)):
-        raise RetryableOrderError('SES_FROM_EMAIL or SUPPORT_EMAIL is invalid')
+        raise RetryableOrderError('Email sender or SUPPORT_EMAIL is invalid')
     parsed = urllib.parse.urlparse(site_url)
     if parsed.scheme != 'https' or not parsed.netloc or parsed.username or parsed.password or parsed.path not in ('', '/') or parsed.query or parsed.fragment:
         raise RetryableOrderError('ORDER_SITE_URL must be an HTTPS origin')
@@ -737,11 +783,9 @@ def send_order_confirmation(dynamodb, table_name: str, item_id: int,
             f'Check the latest status and tracking here: {order_url}\n\n'
             f'Questions? Write to {support_email}.\n')
     try:
-        boto3.client('ses', region_name=os.environ.get('SES_REGION', 'us-east-1')).send_email(
-            Source=sender, Destination={'ToAddresses': [recipient['email']]},
-            ReplyToAddresses=[support_email],
-            Message={'Subject': {'Data': f'Your Mystery File order {order_id}', 'Charset': 'UTF-8'},
-                     'Body': {'Text': {'Data': body, 'Charset': 'UTF-8'}}})
+        send = send_confirmation_resend if provider == 'resend' else send_confirmation_ses
+        send(sender, recipient['email'], support_email,
+             f'Your Mystery File order {order_id}', body, order_id)
     except Exception:
         table.update_item(Key={'ID': item_id},
                           UpdateExpression='REMOVE ConfirmationEmailClaimedAt',
@@ -752,7 +796,15 @@ def send_order_confirmation(dynamodb, table_name: str, item_id: int,
                       UpdateExpression='SET ConfirmationEmailSentAt = :sent REMOVE ConfirmationEmailClaimedAt',
                       ConditionExpression='ConfirmationEmailClaimedAt = :claim',
                       ExpressionAttributeValues={':sent': utc_now(), ':claim': claim})
-    print(f'Confirmation email accepted by SES for order {order_id}')
+    print(f'Confirmation email accepted by {provider} for order {order_id}')
+
+
+def send_completed_order_confirmation(dynamodb, table_name: str, item_id: int,
+                                      order_id: str, recipient: dict, size: str, pricing: dict) -> None:
+    try:
+        send_order_confirmation(dynamodb, table_name, item_id, order_id, recipient, size, pricing)
+    except Exception as error:
+        raise ConfirmationEmailError(f'Confirmation email failed for order {order_id}') from error
 
 
 # ============================================================================
@@ -810,13 +862,13 @@ def lambda_handler(event, context):
                     dynamodb, files_table, state_table, order_id, payment_intent_id,
                     size, assigned_item_id)
                 item_id = assigned_item_id
-        if item.get('Status') == 'SOLD':
-            send_order_confirmation(dynamodb, files_table, item_id, order_id, recipient,
-                                    size, payment_pricing(payment_intent))
+        if item.get('Status') in ('SOLD', 'DRAFT_ONLY'):
+            send_completed_order_confirmation(dynamodb, files_table, item_id, order_id, recipient,
+                                              size, payment_pricing(payment_intent))
             return {'statusCode': 200, 'body': json.dumps({
                 'order_id': order_id, 'item_id': item_id,
                 'file_id': item.get('FileID'),
-                'printful_order_id': int(item['PrintfulOrderID']), 'status': 'SOLD'})}
+                'printful_order_id': int(item['PrintfulOrderID']), 'status': item['Status']})}
         if item.get('Status') in ('FAILED', 'REFUNDED_FAILED'):
             raise PermanentOrderError(f"Order is already {item.get('Status')}")
 
@@ -853,7 +905,7 @@ def lambda_handler(event, context):
                 dynamodb, files_table, item_id, 'DRAFT_ONLY',
                 PrintfulOrderID=int(printful_order_id), StripePaymentStatus=captured['status'],
                 PrintfulStatus=printful_order['status'], FileID=file_id)
-            send_order_confirmation(dynamodb, files_table, item_id, order_id, recipient, size, pricing)
+            send_completed_order_confirmation(dynamodb, files_table, item_id, order_id, recipient, size, pricing)
             return {'statusCode': 200, 'body': json.dumps({
                 'order_id': order_id, 'item_id': item_id, 'file_id': file_id,
                 'printful_order_id': int(printful_order_id), 'status': 'DRAFT_ONLY'})}
@@ -874,11 +926,13 @@ def lambda_handler(event, context):
             dynamodb, files_table, item_id, 'SOLD',
             PrintfulOrderID=int(printful_order_id), StripePaymentStatus=captured['status'],
             PrintfulStatus=confirmed['status'], FileID=file_id)
-        send_order_confirmation(dynamodb, files_table, item_id, order_id, recipient, size, pricing)
+        send_completed_order_confirmation(dynamodb, files_table, item_id, order_id, recipient, size, pricing)
         return {'statusCode': 200, 'body': json.dumps({
             'order_id': order_id, 'item_id': item_id, 'file_id': file_id,
             'printful_order_id': int(printful_order_id), 'status': 'SOLD'})}
 
+    except ConfirmationEmailError:
+        raise
     except RetryableOrderError as error:
         if item:
             update_workflow_status(
