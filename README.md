@@ -319,6 +319,70 @@ The separate Next.js/Vercel backend role needs only:
 Vercel OIDC is preferred over permanent AWS access keys. See
 `../docs/BACKEND_INTEGRATION.md` for the route contract and policy.
 
+## Operations runbook
+
+The Lambda only refunds failures it detects while processing. Once an order is
+`SOLD`, later Printful holds or cancellations are not refunded automatically.
+Customer-facing promises are in the frontend Terms (`/terms#refunds` and
+`/terms#shipping`).
+
+### Daily Printful check
+
+In the Printful dashboard, review every order that is **On hold**, **Canceled**,
+**Failed**, **Returned**, or has an open problem report.
+
+| Printful state | Action |
+|---|---|
+| On hold (billing) | Fix the Printful billing method; the order resumes |
+| On hold (content, address, stock) | Resolve with Printful; if it cannot ship, cancel it in Printful and refund |
+| Canceled / Failed, never shipped | Refund in Stripe and mark the row `REFUNDED_FAILED` (below) |
+| Returned (bad address, refused, unclaimed) | No refund; reship only after the customer pays reprint and reshipping costs. Printful holds returns for about 30 days |
+
+### Refunding an order that will not ship
+
+1. Stripe Dashboard: open the payment by its `PaymentIntentID` from DynamoDB and
+   issue a **full refund**. If it is still uncaptured, cancel the authorization
+   instead.
+2. DynamoDB console, inventory row with that `OrderID`: set `Status` to
+   `REFUNDED_FAILED` and set a short `ErrorMessage` such as
+   `Printful canceled after submission; refunded manually`. The order page then
+   shows the refund. The Lambda cannot make this transition itself because
+   `SOLD` is terminal.
+
+### Defect, misprint, or damaged-on-arrival claims
+
+The Terms promise a 30-day Limited Warranty. Customers must email support within
+30 days of delivery with their order reference and a clear photo of the entire
+shirt.
+
+1. Check the photo and that the claim is within 30 days of delivery.
+2. In Printful, open the order and use **Report problem** with the photos.
+   Printful's window is also 30 days after delivery, so file promptly.
+3. Prefer Printful's free reprint. Refund in Stripe only if a replacement is
+   not possible. Do not refund for size, fit, color variation, or document
+   content.
+
+### Lost packages
+
+The Terms do not obligate a replacement. If tracking stalls with no delivery
+scan, you may file a Printful lost-package report within 30 days of the
+estimated delivery date; Printful covers reprint and reshipping when the carrier
+confirms loss. Packages the carrier marks as delivered are not covered by
+Printful.
+
+### Confirmation email retry
+
+If the alarm shows a confirmation email failure on a `SOLD` or `DRAFT_ONLY`
+order, fix the email configuration, then run a Lambda console test event:
+
+```json
+{"order_id": "<OrderID>", "payment_intent_id": "<PaymentIntentID>", "size": "<S|M|L|XL>", "quantity": 1}
+```
+
+The Lambda reads the customer email from Stripe and only sends the email. Do not
+use this for rows in `PROCESSING_RETRY` or other non-terminal states without
+first reconciling them with Stripe and Printful.
+
 ## Orphan cleanup
 
 Automatic cleanup is safe only before Printful draft creation/capture:
